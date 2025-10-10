@@ -125,7 +125,11 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
     # Verificar que el tipo de embedding coincida con el del PDF
     pdf_embedding_type = get_pdf_embedding_type(pdf_id)
     if pdf_embedding_type and pdf_embedding_type != embedding_type:
-        raise Exception(f"El PDF fue subido con embeddings '{pdf_embedding_type}', pero intentas usar '{embedding_type}'")
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail=f"⚠️ Incompatibilidad de modelos: El PDF se subió con '{pdf_embedding_type.upper()}', pero intentas usar '{embedding_type.upper()}'. Por favor, sube el PDF nuevamente con el modelo correcto."
+        )
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     if embedding_type == "ollama":
