@@ -25,6 +25,15 @@
         </div>
       </div>
 
+      <!-- Filtro por etiqueta -->
+      <div v-if="uniqueTags.length > 0" class="tag-filter" style="padding: 8px 12px;">
+        <div style="color:#9ca3af; font-size:12px; margin-bottom:8px;">Filtrar por etiqueta</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="tag-chip" :class="{ active: !activeTag }" @click="setActiveTag(null)">Todas</button>
+          <button v-for="t in uniqueTags" :key="t" class="tag-chip" :class="{ active: activeTag === t }" @click="setActiveTag(t)">{{ t }} <span class="tag-count">{{ tagCounts[t] || 0 }}</span></button>
+        </div>
+      </div>
+
       <!-- Nuevo Chat Button -->
       <button class="new-chat-btn" @click="startNewChat">
         <span class="icon">➕</span>
@@ -68,10 +77,12 @@
         :documents="recentDocuments"
         :active-document-id="currentDocument ? currentDocument.id : null"
         :active-folder-id="activeFolderId"
+        :active-tag="activeTag"
         :show-favorites="showOnlyFavorites"
         @select="selectDocument"
         @toggle-favorite="toggleFavorite"
         @open-tags="openTagsPanel"
+        @remove-tag="removeTagFromDoc"
       />
 
       <!-- Botón para ver historial de conversaciones -->
@@ -243,6 +254,7 @@
       :initial-tags="(recentDocuments.find(d => d.id === tagEditorDocId) || {}).tags || []"
       @close="showTagEditor = false"
       @save="saveTagsForDoc"
+      @update="autosaveTagsForDoc"
     />
   </div>
 </template>
@@ -322,6 +334,8 @@ export default {
   // Tag editor
   showTagEditor: false,
   tagEditorDocId: null,
+  // Tag filter
+  activeTag: null,
 
       // Sidebar helpers
       showConversationsPanel: false
@@ -349,6 +363,22 @@ export default {
   computed: {
     favoriteDocuments() {
       return (this.recentDocuments || []).filter(d => d.favorite);
+    }
+    ,
+    uniqueTags() {
+      const s = new Set();
+      (this.recentDocuments || []).forEach(d => {
+        (d.tags || []).forEach(t => s.add(t));
+      });
+      return Array.from(s);
+    }
+    ,
+    tagCounts() {
+      const counts = {};
+      (this.recentDocuments || []).forEach(d => {
+        (d.tags || []).forEach(t => { counts[t] = (counts[t] || 0) + 1; });
+      });
+      return counts;
     }
   },
 
@@ -495,6 +525,22 @@ export default {
         });
     },
 
+      autosaveTagsForDoc(tags) {
+        // Similar to saveTagsForDoc but doesn't close the editor (used for live updates)
+        const doc = this.recentDocuments.find(d => d.id === this.tagEditorDocId);
+        if (!doc) return;
+        doc.tags = tags;
+        const payload = JSON.stringify({ tags });
+        const form = new FormData(); form.append('metadata', payload);
+        fetch(`http://localhost:8000/documents/${doc.id}/metadata`, { method: 'POST', body: form })
+          .then(() => {
+            this.saveRecentDocuments();
+          })
+          .catch(() => {
+            this.saveRecentDocuments();
+          });
+      },
+
     moveDocumentToFolder(documentId, folderId) {
       this.recentDocuments = this.recentDocuments.map(d => d.id === documentId ? { ...d, folderId } : d);
       // Send metadata to backend
@@ -512,6 +558,23 @@ export default {
         });
     },
 
+    removeTagFromDoc({ docId, tag }) {
+      const doc = this.recentDocuments.find(d => d.id === docId);
+      if (!doc) return;
+      doc.tags = (doc.tags || []).filter(t => t !== tag);
+      const payload = JSON.stringify({ tags: doc.tags });
+      const form = new FormData(); form.append('metadata', payload);
+      fetch(`http://localhost:8000/documents/${docId}/metadata`, { method: 'POST', body: form })
+        .then(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Etiqueta eliminada', 'success');
+        })
+        .catch(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Etiqueta eliminada localmente (sin sync)', 'warning');
+        });
+    },
+
     toggleFavorite(docId) {
       this.recentDocuments = this.recentDocuments.map(d => d.id === docId ? { ...d, favorite: !d.favorite } : d);
       const doc = this.recentDocuments.find(d => d.id === docId);
@@ -526,6 +589,12 @@ export default {
           this.saveRecentDocuments();
           this.showToastMessage('Favorito cambiado localmente (sin sync)', 'warning');
         });
+    },
+
+    setActiveTag(tag) {
+      this.activeTag = tag;
+      // No hacemos fetch al backend; DocumentList hará el filtrado cliente
+      this.showToastMessage(tag ? `Filtrando por etiqueta: ${tag}` : 'Filtro de etiqueta desactivado', 'info');
     },
 
 
@@ -603,6 +672,35 @@ export default {
       const { file, embeddingType } = payload;
       if (!file) return;
 
+      // Compute SHA-256 hash of file and check with backend by hash
+      let fileHash = null;
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+        // Check by hash (more reliable) using the new backend filter
+        try {
+          if (fileHash) {
+            const checkRes = await fetch(`http://localhost:8000/pdfs/?hash=${fileHash}`);
+            if (checkRes.ok) {
+              const d = await checkRes.json();
+              // If any pdf matches this hash, cancel upload
+              if (d.pdfs && d.pdfs.length > 0) {
+                this.showToastMessage('Este PDF ya existe en la base de datos (por contenido). Subida cancelada.', 'warning');
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          // ignore check errors and proceed with upload; server will still reject duplicates
+        }
+      } catch (err) {
+        // ignore hashing errors and proceed without hash
+        fileHash = null;
+      }
+
       this.isUploading = true;
       this.uploadProgress = 0;
       this.embeddingType = embeddingType;
@@ -619,6 +717,7 @@ export default {
           }
         }, 200);
 
+        if (fileHash) formData.append('file_hash', fileHash);
         const response = await fetch('http://localhost:8000/upload_pdf/', {
           method: 'POST',
           body: formData
@@ -1390,6 +1489,10 @@ export default {
 .fav-list { display:flex; flex-direction:column; gap:6px; }
 .fav-item { background: transparent; border: none; color: #e4e6eb; text-align: left; padding: 8px; border-radius: 8px; cursor: pointer; }
 .fav-item:hover { background: #1e2640; }
+
+.tag-chip { background: transparent; border: 1px solid #2a3152; color: #9ca3af; padding: 6px 8px; border-radius: 12px; cursor: pointer; font-size: 13px; }
+.tag-chip.active { background: #4d6cfa; color: white; border-color: #4d6cfa; }
+.tag-count { margin-left: 6px; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 8px; font-size: 12px; }
 
 /* History Section */
 .history-section {

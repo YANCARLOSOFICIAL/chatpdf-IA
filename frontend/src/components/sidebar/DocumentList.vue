@@ -37,6 +37,12 @@
         <div class="doc-info">
           <div class="doc-name" v-html="highlightText(doc.name)"></div>
           <div class="doc-date">{{ doc.date }}</div>
+              <div class="doc-tags">
+                <span v-for="(t, idx) in (doc.tags || [])" :key="idx" class="tag-chip-inline">
+                  {{ t }}
+                  <button class="tag-x" @click.stop.prevent="$emit('remove-tag', { docId: doc.id, tag: t })" title="Eliminar etiqueta">✕</button>
+                </span>
+              </div>
         </div>
 
         <div class="doc-actions">
@@ -77,12 +83,17 @@ export default {
       type: [String, Number],
       default: null
     },
+    // Filtrar por etiqueta (tag)
+    activeTag: {
+      type: String,
+      default: null
+    },
     showFavorites: {
       type: Boolean,
       default: false
     }
   },
-  emits: ['select', 'toggle-favorite', 'open-tags'],
+  emits: ['select', 'toggle-favorite', 'open-tags', 'remove-tag'],
   data() {
     return {
       searchQuery: ''
@@ -106,6 +117,11 @@ export default {
       if (this.searchQuery.trim()) {
         const query = this.searchQuery.toLowerCase().trim();
         docs = docs.filter(doc => doc.name.toLowerCase().includes(query));
+      }
+
+      // Filtrar por etiqueta si se indicó
+      if (this.activeTag) {
+        docs = docs.filter(d => Array.isArray(d.tags) && d.tags.includes(this.activeTag));
       }
 
       // Orden simple: favoritos primero
@@ -326,6 +342,15 @@ export default {
   background: #2a3152;
   border-color: #4d6cfa;
 }
+
+.doc-tags { margin-top: 6px; display:flex; gap:6px; flex-wrap:wrap; }
+.tag-chip-inline { background:#101428; color:#9ca3af; padding:4px 8px; border-radius:12px; font-size:12px; }
+.tag-chip-inline:hover { background:#1e2640; color:#e4e6eb; }
+
+.tag-chip.active { background:#4d6cfa; color:white; }
+
+.tag-x { margin-left:8px; background:transparent; border:none; color:#9ca3af; cursor:pointer; padding:2px 6px; border-radius:6px; }
+.tag-x:hover { background:#2a3152; color:#e4e6eb; }
 
 /* Light mode */
 :global(#app.light-mode) .section-title {

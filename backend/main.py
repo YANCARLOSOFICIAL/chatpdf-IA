@@ -1,5 +1,6 @@
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import hashlib
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import tempfile
@@ -81,6 +82,15 @@ def init_db_schema():
                 uploaded_at TIMESTAMPTZ
             )
         ''')
+        # add hash column to pdfs for duplicate detection
+        try:
+            cur.execute("ALTER TABLE pdfs ADD COLUMN IF NOT EXISTS hash TEXT UNIQUE")
+        except Exception:
+            try:
+                cur.execute("ALTER TABLE pdfs ADD COLUMN hash TEXT")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS pdfs_hash_idx ON pdfs(hash)")
+            except Exception:
+                pass
         conn.commit()
 
 init_db_schema()
@@ -261,8 +271,16 @@ def save_embedding(pdf_id, chunk, embedding, embedding_type):
         conn.commit()
 
 def create_pdf_entry(filename, embedding_type):
+    # kept for backward compatibility
+    return create_pdf_entry_with_hash(filename, embedding_type, None)
+
+
+def create_pdf_entry_with_hash(filename, embedding_type, file_hash=None):
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO pdfs (filename, embedding_type) VALUES (%s, %s) RETURNING id", (filename, embedding_type))
+        if file_hash:
+            cur.execute("INSERT INTO pdfs (filename, embedding_type, hash) VALUES (%s, %s, %s) RETURNING id", (filename, embedding_type, file_hash))
+        else:
+            cur.execute("INSERT INTO pdfs (filename, embedding_type) VALUES (%s, %s) RETURNING id", (filename, embedding_type))
         pdf_id = cur.fetchone()[0]
         conn.commit()
     return pdf_id
@@ -287,16 +305,74 @@ def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
         return [row[0] for row in cur.fetchall()]
 
 @app.post("/upload_pdf/")
-async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...)):
+async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...), file_hash: str = Form(None)):
+    # Read bytes and compute hash if not provided
+    file_bytes = await pdf.read()
+    computed_hash = hashlib.sha256(file_bytes).hexdigest()
+    file_hash = file_hash or computed_hash
+
+    # Server-side duplicate check by hash (preferred)
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pdfs WHERE hash = %s", (file_hash,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail=f"PDF with same content already exists")
+
+    # Fallback: if hash column wasn't populated historically, also check filename
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pdfs WHERE filename = %s", (pdf.filename,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail=f"PDF with filename '{pdf.filename}' already exists")
+
+    # Heuristic: some existing PDFs might store a hash computed from extracted
+    # chunks (or have NULL). Compare the incoming binary file hash against a
+    # chunk-derived fingerprint for existing PDFs. If matched, update the
+    # existing row to the binary file hash (so future checks are direct) and
+    # reject the upload.
+    with conn.cursor() as cur_all:
+        cur_all.execute("SELECT id, hash FROM pdfs")
+        all_rows = cur_all.fetchall()
+
+    for existing_id, stored_hash in all_rows:
+        # If stored_hash equals the incoming binary hash, we already handled it
+        if stored_hash == file_hash:
+            raise HTTPException(status_code=409, detail=f"PDF with same content already exists")
+
+        # Compute chunk-based fingerprint and compare to incoming binary hash
+        chunks = []
+        with conn.cursor() as cur2:
+            try:
+                cur2.execute("SELECT chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (existing_id,))
+                chunks += [r[0] for r in cur2.fetchall()]
+            except Exception:
+                pass
+            try:
+                cur2.execute("SELECT chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (existing_id,))
+                chunks += [r[0] for r in cur2.fetchall()]
+            except Exception:
+                pass
+
+        if not chunks:
+            continue
+
+        combined = ''.join([c or '' for c in chunks])
+        chunk_hash = hashlib.sha256(combined.encode('utf-8')).hexdigest()
+        if chunk_hash == file_hash:
+            # Update the stored hash to the binary file hash for faster future checks
+            with conn.cursor() as cur3:
+                cur3.execute("UPDATE pdfs SET hash = %s WHERE id = %s", (file_hash, existing_id))
+                conn.commit()
+            raise HTTPException(status_code=409, detail=f"PDF with same content already exists (matched by stored text chunks)")
+
+    # write temp file for text extraction
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(await pdf.read())
+        tmp.write(file_bytes)
         tmp_path = tmp.name
     text = extract_text_from_pdf(tmp_path)
     os.remove(tmp_path)
 
     # Dividir texto en chunks simples
     chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
-    pdf_id = create_pdf_entry(pdf.filename, embedding_type)
+    pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     for chunk in chunks:
@@ -491,24 +567,31 @@ async def set_document_metadata(pdf_id: int, metadata: str = Form(...)):
 
 
 @app.get("/pdfs/")
-async def list_pdfs(folder_id: int = None):
-    # Fetch PDFs from database with folder_id
+async def list_pdfs(folder_id: int = None, name: str = None, hash: str = None):
+    # Fetch PDFs from database with optional folder_id or exact name filter
     with conn.cursor() as cur:
-        if folder_id is None:
-            cur.execute("SELECT id, filename, embedding_type, folder_id FROM pdfs ORDER BY id DESC")
+        if hash:
+            # exact hash match
+            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE hash = %s ORDER BY id DESC", (hash,))
+        elif name:
+            # exact filename match (case-insensitive)
+            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE LOWER(filename) = LOWER(%s) ORDER BY id DESC", (name,))
+        elif folder_id is None:
+            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs ORDER BY id DESC")
         else:
-            cur.execute("SELECT id, filename, embedding_type, folder_id FROM pdfs WHERE folder_id = %s ORDER BY id DESC", (folder_id,))
+            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE folder_id = %s ORDER BY id DESC", (folder_id,))
         rows = cur.fetchall()
 
     results = []
     for r in rows:
-        pdf_id, filename, embedding_type, folder_val = r
+        pdf_id, filename, embedding_type, folder_val, file_hash = r
         meta = get_pdf_metadata_from_db(pdf_id)
         entry = {
             'id': pdf_id,
             'name': filename,
             'embeddingType': embedding_type,
             'folderId': folder_val,
+            'hash': file_hash,
             'favorite': meta.get('favorite', False),
             'tags': meta.get('tags', []),
             'uploadedAt': meta.get('uploadedAt')
@@ -525,3 +608,41 @@ async def list_folders():
         rows = cur.fetchall()
     folders = [{'id': r[0], 'name': r[1]} for r in rows]
     return {'folders': folders}
+
+
+@app.post('/admin/fill_hashes/')
+async def admin_fill_hashes():
+    """Admin endpoint: compute SHA-256 fingerprints for PDFs with NULL hash
+    by concatenating stored chunks (openai/ollama tables) and updating the pdfs table.
+    Returns a summary of updated rows.
+    """
+    updated = []
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pdfs WHERE hash IS NULL")
+        rows = cur.fetchall()
+
+    for (pdf_id,) in rows:
+        chunks = []
+        with conn.cursor() as cur2:
+            try:
+                cur2.execute("SELECT chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+                chunks += [r[0] for r in cur2.fetchall()]
+            except Exception:
+                pass
+            try:
+                cur2.execute("SELECT chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+                chunks += [r[0] for r in cur2.fetchall()]
+            except Exception:
+                pass
+
+        if not chunks:
+            continue
+
+        combined = ''.join([c or '' for c in chunks])
+        file_hash = hashlib.sha256(combined.encode('utf-8')).hexdigest()
+        with conn.cursor() as cur3:
+            cur3.execute("UPDATE pdfs SET hash = %s WHERE id = %s", (file_hash, pdf_id))
+            conn.commit()
+        updated.append({'id': pdf_id, 'hash': file_hash})
+
+    return {'updated': updated, 'count': len(updated)}

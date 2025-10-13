@@ -10,7 +10,7 @@
         <div class="existing-tags">
           <span v-for="(tag, idx) in tags" :key="idx" class="tag-chip">
             {{ tag }}
-            <button class="x" @click="removeTag(idx)">✕</button>
+            <button class="x" @click.stop.prevent="removeTag(idx)" title="Eliminar etiqueta">✕</button>
           </span>
         </div>
 
@@ -56,12 +56,15 @@ export default {
       if (!t) return;
       if (!this.tags.includes(t)) this.tags.push(t);
       this.newTag = '';
+      this.$emit('update', this.tags);
     },
     addSuggested(s) {
       if (!this.tags.includes(s)) this.tags.push(s);
+      this.$emit('update', this.tags);
     },
     removeTag(idx) {
       this.tags.splice(idx, 1);
+      this.$emit('update', this.tags);
     },
     save() {
       this.$emit('save', this.tags);
