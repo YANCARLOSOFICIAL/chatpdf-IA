@@ -32,10 +32,46 @@
       </button>
 
       <!-- Documentos Recientes -->
+      <!-- Favoritos rápido -->
+      <div v-if="favoriteDocuments.length > 0" class="favorites-quick">
+        <h4 class="fav-title">Favoritos</h4>
+        <div class="fav-list">
+          <button v-for="f in favoriteDocuments" :key="f.id" class="fav-item" @click="selectDocument(f)">
+            📌 {{ f.name }}
+          </button>
+        </div>
+      </div>
+      <!-- Carpetas -->
+      <FolderList
+        :folders="folders"
+        :active-folder-id="activeFolderId"
+        :documents="recentDocuments"
+        @select="selectFolder"
+        @new="createFolder"
+        @delete="deleteFolder"
+        @drop="({ docId, folderId }) => moveDocumentToFolder(docId, folderId)"
+        @select-document="selectDocument"
+      />
+
+      <!-- Filtro por carpeta (DocumentList pregunta por activeFolderId) -->
+      <div class="folder-filter-controls" v-if="folders.length > 0">
+        <button class="filter-btn" :class="{ active: !activeFolderId }" @click="selectFolder(null)">Todas</button>
+        <button v-for="f in folders" :key="f.id" class="filter-btn" :class="{ active: activeFolderId === f.id }" @click="selectFolder(f.id)">{{ f.name }}</button>
+      </div>
+
+      <!-- Mostrar solo favoritos -->
+      <div class="favorites-toggle" style="padding: 8px 12px 12px;">
+        <label style="color:#9ca3af; font-size:13px; display:flex; gap:8px; align-items:center;"><input type="checkbox" v-model="showOnlyFavorites" /> Mostrar solo favoritos</label>
+      </div>
+
       <DocumentList 
         :documents="recentDocuments"
         :active-document-id="currentDocument ? currentDocument.id : null"
+        :active-folder-id="activeFolderId"
+        :show-favorites="showOnlyFavorites"
         @select="selectDocument"
+        @toggle-favorite="toggleFavorite"
+        @open-tags="openTagsPanel"
       />
 
       <!-- Botón para ver historial de conversaciones -->
@@ -200,12 +236,22 @@
       :visible="showShortcutsModal"
       @close="showShortcutsModal = false"
     />
+
+    <!-- Tag Editor Modal -->
+    <TagEditor
+      :visible="showTagEditor"
+      :initial-tags="(recentDocuments.find(d => d.id === tagEditorDocId) || {}).tags || []"
+      @close="showTagEditor = false"
+      @save="saveTagsForDoc"
+    />
   </div>
 </template>
 
 <script>
 import DragOverlay from './components/ui/DragOverlay.vue';
 import DocumentList from './components/sidebar/DocumentList.vue';
+import FolderList from './components/sidebar/FolderList.vue';
+import TagEditor from './components/sidebar/TagEditor.vue';
 import ConversationList from './components/sidebar/ConversationList.vue';
 import UploadArea from './components/chat/UploadArea.vue';
 import WelcomeMessage from './components/chat/WelcomeMessage.vue';
@@ -219,7 +265,9 @@ export default {
   name: 'App',
   components: {
     DragOverlay,
-    DocumentList,
+  DocumentList,
+  FolderList,
+  TagEditor,
     ConversationList,
     UploadArea,
     WelcomeMessage,
@@ -237,13 +285,18 @@ export default {
       isDarkMode: true,
       isDragging: false,
 
-      // Document State
-      currentDocument: null,
-      recentDocuments: [],
-      selectedFile: null,
-      embeddingType: 'openai',
-      isUploading: false,
-      uploadProgress: 0,
+  // Document State
+  currentDocument: null,
+  recentDocuments: [],
+  selectedFile: null,
+  embeddingType: 'openai',
+  isUploading: false,
+  uploadProgress: 0,
+
+  // Folders / Categories
+  folders: [],
+  activeFolderId: null,
+      showOnlyFavorites: false,
 
       // Chat State
       messages: [],
@@ -252,7 +305,7 @@ export default {
       isTyping: false,
       copiedMessageIndex: null,
 
-      // Conversations
+  // Conversations
       conversations: [],
       currentConversationId: null,
       showConversationsPanel: false,
@@ -265,16 +318,24 @@ export default {
       },
 
       // Modals
-      showShortcutsModal: false
+      showShortcutsModal: false,
+  // Tag editor
+  showTagEditor: false,
+  tagEditorDocId: null,
+
+      // Sidebar helpers
+      showConversationsPanel: false
     };
   },
 
   mounted() {
     this.checkMobile();
     window.addEventListener('resize', this.checkMobile);
-    this.loadRecentDocuments();
-    this.loadConversations();
-    this.loadTheme();
+  this.loadRecentDocuments();
+  this.loadDocumentsFromBackend();
+  this.loadFolders();
+  this.loadConversations();
+  this.loadTheme();
     this.setupDragAndDrop();
     this.setupKeyboardShortcuts();
   },
@@ -283,6 +344,12 @@ export default {
     window.removeEventListener('resize', this.checkMobile);
     this.removeDragAndDrop();
     this.removeKeyboardShortcuts();
+  },
+
+  computed: {
+    favoriteDocuments() {
+      return (this.recentDocuments || []).filter(d => d.favorite);
+    }
   },
 
   methods: {
@@ -301,9 +368,166 @@ export default {
       }
     },
 
+    async loadDocumentsFromBackend(folderId = null) {
+      try {
+        const url = folderId ? `http://localhost:8000/pdfs/?folder_id=${folderId}` : 'http://localhost:8000/pdfs/';
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('No backend');
+        const data = await res.json();
+        if (data && Array.isArray(data.pdfs)) {
+          // Map backend shape to frontend recentDocuments
+          this.recentDocuments = data.pdfs.map(p => ({
+            id: p.id,
+            name: p.name,
+            pages: p.pages || 0,
+            date: p.uploadedAt || '',
+            uploadedAt: p.uploadedAt || null,
+            embeddingType: p.embeddingType || 'openai',
+            folderId: p.folderId || null,
+            favorite: !!p.favorite,
+            tags: p.tags || []
+          }));
+          this.saveRecentDocuments();
+        }
+      } catch (err) {
+        // keep localStorage data if backend not available
+      }
+    },
+
     saveRecentDocuments() {
       localStorage.setItem('chatpdf-documents', JSON.stringify(this.recentDocuments));
     },
+
+    // Folders management
+    loadFolders() {
+      // Try to fetch folders from backend first
+      fetch('http://localhost:8000/folders/')
+        .then(res => res.json())
+        .then(data => {
+          this.folders = data.folders || [];
+        })
+        .catch(() => {
+          const saved = localStorage.getItem('chatpdf-folders');
+          this.folders = saved ? JSON.parse(saved) : [];
+        });
+    },
+
+    saveFolders() {
+      localStorage.setItem('chatpdf-folders', JSON.stringify(this.folders));
+    },
+
+    createFolder(name) {
+      // Create on backend
+      const form = new FormData();
+      form.append('name', name);
+      fetch('http://localhost:8000/folders/', { method: 'POST', body: form })
+        .then(r => r.json())
+        .then(folder => {
+          this.folders.unshift(folder);
+          this.showToastMessage(`Carpeta creada: ${name}`, 'success');
+        })
+        .catch(() => {
+          const folder = { id: Date.now(), name };
+          this.folders.unshift(folder);
+          this.saveFolders();
+          this.showToastMessage(`Carpeta creada en local: ${name}`, 'warning');
+        });
+    },
+
+    deleteFolder(folderId) {
+      if (!confirm('Eliminar carpeta y mantener documentos sin carpeta?')) return;
+      fetch(`http://localhost:8000/folders/${folderId}`, { method: 'DELETE' })
+        .then(() => {
+          this.folders = this.folders.filter(f => f.id !== folderId);
+          // reload documents from backend to reflect server state
+          this.loadDocumentsFromBackend(this.activeFolderId);
+          if (this.activeFolderId === folderId) this.activeFolderId = null;
+          this.showToastMessage('Carpeta eliminada', 'info');
+        })
+        .catch(() => {
+          this.folders = this.folders.filter(f => f.id !== folderId);
+          this.saveFolders();
+          this.showToastMessage('Carpeta eliminada localmente', 'warning');
+        });
+    },
+
+    selectFolder(folderId) {
+      // Toggle folder: clicking the active folder will deselect it (close)
+      if (this.activeFolderId === folderId) {
+        this.activeFolderId = null;
+        this.showToastMessage('Carpeta cerrada', 'info');
+        // load all documents
+        this.loadDocumentsFromBackend(null);
+      } else {
+        this.activeFolderId = folderId;
+        this.showToastMessage('Carpeta seleccionada', 'info');
+        // load documents for this folder from backend
+        this.loadDocumentsFromBackend(folderId);
+      }
+      // Close conversations panel when switching folders
+      this.showConversationsPanel = false;
+    },
+
+    openTagsPanel(docId) {
+      this.tagEditorDocId = docId;
+      this.showTagEditor = true;
+    },
+
+    saveTagsForDoc(tags) {
+      const doc = this.recentDocuments.find(d => d.id === this.tagEditorDocId);
+      if (!doc) return;
+      doc.tags = tags;
+      // send to backend
+      const payload = JSON.stringify({ tags });
+      const form = new FormData(); form.append('metadata', payload);
+      fetch(`http://localhost:8000/documents/${doc.id}/metadata`, { method: 'POST', body: form })
+        .then(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Etiquetas guardadas', 'success');
+          this.showTagEditor = false;
+          this.tagEditorDocId = null;
+        })
+        .catch(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Etiquetas guardadas localmente (sin sync)', 'warning');
+          this.showTagEditor = false;
+          this.tagEditorDocId = null;
+        });
+    },
+
+    moveDocumentToFolder(documentId, folderId) {
+      this.recentDocuments = this.recentDocuments.map(d => d.id === documentId ? { ...d, folderId } : d);
+      // Send metadata to backend
+      const payload = JSON.stringify({ folderId });
+      const form = new FormData(); form.append('metadata', payload);
+      fetch(`http://localhost:8000/documents/${documentId}/metadata`, { method: 'POST', body: form })
+        .then(() => {
+          // reload documents from backend for the active folder (server is source of truth)
+          this.loadDocumentsFromBackend(this.activeFolderId);
+          this.showToastMessage('Documento movido', 'success');
+        })
+        .catch(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Documento movido localmente (sin sync)', 'warning');
+        });
+    },
+
+    toggleFavorite(docId) {
+      this.recentDocuments = this.recentDocuments.map(d => d.id === docId ? { ...d, favorite: !d.favorite } : d);
+      const doc = this.recentDocuments.find(d => d.id === docId);
+      const payload = JSON.stringify({ favorite: !!doc.favorite });
+      const form = new FormData(); form.append('metadata', payload);
+      fetch(`http://localhost:8000/documents/${docId}/metadata`, { method: 'POST', body: form })
+        .then(() => {
+          this.loadDocumentsFromBackend(this.activeFolderId);
+          this.saveRecentDocuments();
+        })
+        .catch(() => {
+          this.saveRecentDocuments();
+          this.showToastMessage('Favorito cambiado localmente (sin sync)', 'warning');
+        });
+    },
+
 
     handleFileSelect(event) {
       const file = event.target.files[0];
@@ -415,7 +639,10 @@ export default {
           pages: 45, // Podrías obtener esto del backend
           date: 'Hoy',
           uploadedAt: new Date().toISOString(),
-          embeddingType: embeddingType
+          embeddingType: embeddingType,
+          folderId: this.activeFolderId || null,
+          favorite: false,
+          tags: []
         };
 
         this.currentDocument = newDoc;
@@ -1155,6 +1382,14 @@ export default {
 .new-chat-btn .icon {
   font-size: 18px;
 }
+
+.favorites-quick {
+  padding: 0 12px 12px;
+}
+.fav-title { font-size: 12px; color: #9ca3af; margin: 0 0 6px; }
+.fav-list { display:flex; flex-direction:column; gap:6px; }
+.fav-item { background: transparent; border: none; color: #e4e6eb; text-align: left; padding: 8px; border-radius: 8px; cursor: pointer; }
+.fav-item:hover { background: #1e2640; }
 
 /* History Section */
 .history-section {

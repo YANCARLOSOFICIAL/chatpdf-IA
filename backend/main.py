@@ -11,6 +11,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import json
+from pathlib import Path
+
+# Simple JSON metadata store for folders, document metadata (favorites, tags, folder assignments)
+METADATA_PATH = Path(__file__).resolve().parent / 'metadata_store.json'
+
+def load_metadata():
+    if not METADATA_PATH.exists():
+        return {"folders": [], "documents": {}}
+    # Try multiple encodings to avoid decode errors from files saved on Windows
+    try:
+        with open(METADATA_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        try:
+            with open(METADATA_PATH, 'r', encoding='latin-1') as f:
+                return json.load(f)
+        except Exception:
+            # Fallback: read bytes and replace invalid chars
+            with open(METADATA_PATH, 'rb') as f:
+                text = f.read().decode('utf-8', errors='replace')
+                return json.loads(text)
+
+def save_metadata(data):
+    with open(METADATA_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -25,6 +52,171 @@ app.add_middleware(
 PG_CONN = os.getenv("PG_CONN", "dbname=chatpdf user=postgres password=postgres host=localhost")
 conn = psycopg2.connect(PG_CONN)
 register_vector(conn)
+
+# Ensure folders table and folder_id column exist
+def init_db_schema():
+    with conn.cursor() as cur:
+        # create folders table if not exists
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS folders (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL
+            )
+        ''')
+        # add folder_id column to pdfs if it doesn't exist
+        try:
+            cur.execute("ALTER TABLE pdfs ADD COLUMN IF NOT EXISTS folder_id INTEGER REFERENCES folders(id)")
+        except Exception:
+            # older Postgres versions might not support IF NOT EXISTS; try simple add and ignore error
+            try:
+                cur.execute("ALTER TABLE pdfs ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
+            except Exception:
+                pass
+        # create pdf_metadata table for favorites/tags/uploaded_at
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS pdf_metadata (
+                pdf_id INTEGER PRIMARY KEY REFERENCES pdfs(id) ON DELETE CASCADE,
+                favorite BOOLEAN DEFAULT FALSE,
+                tags JSONB DEFAULT '[]'::jsonb,
+                uploaded_at TIMESTAMPTZ
+            )
+        ''')
+        conn.commit()
+
+init_db_schema()
+
+# DB metadata helpers
+def get_pdf_metadata_from_db(pdf_id):
+    with conn.cursor() as cur:
+        cur.execute("SELECT favorite, tags::text, uploaded_at FROM pdf_metadata WHERE pdf_id = %s", (pdf_id,))
+        r = cur.fetchone()
+        if not r:
+            return {}
+        favorite, tags_text, uploaded_at = r
+        try:
+            tags = json.loads(tags_text)
+        except Exception:
+            tags = []
+        return {'favorite': bool(favorite), 'tags': tags, 'uploadedAt': uploaded_at}
+
+def upsert_pdf_metadata_db(pdf_id, meta):
+    with conn.cursor() as cur:
+        # ensure uploaded_at is set if provided
+        fav = meta.get('favorite')
+        tags = json.dumps(meta.get('tags', [])) if 'tags' in meta else None
+        uploaded = meta.get('uploadedAt')
+        # try update
+        cur.execute("SELECT 1 FROM pdf_metadata WHERE pdf_id = %s", (pdf_id,))
+        exists = cur.fetchone()
+        if exists:
+            if fav is not None:
+                cur.execute("UPDATE pdf_metadata SET favorite = %s WHERE pdf_id = %s", (fav, pdf_id))
+            if tags is not None:
+                cur.execute("UPDATE pdf_metadata SET tags = %s::jsonb WHERE pdf_id = %s", (tags, pdf_id))
+            if uploaded:
+                cur.execute("UPDATE pdf_metadata SET uploaded_at = %s WHERE pdf_id = %s", (uploaded, pdf_id))
+        else:
+            cur.execute("INSERT INTO pdf_metadata (pdf_id, favorite, tags, uploaded_at) VALUES (%s, %s, %s::jsonb, %s)", (pdf_id, fav if fav is not None else False, tags if tags is not None else '[]', uploaded))
+        conn.commit()
+
+from datetime import datetime
+
+# Path to write a simple migration result summary (used by status endpoint)
+MIGRATION_RESULT_PATH = Path(__file__).resolve().parent / 'migration_result.json'
+
+
+def run_migration():
+    """Run migration from metadata_store.json into DB and return a summary dict.
+    This function will be used both at startup (when MIGRATE_METADATA=true) and
+    via the POST /migration/run endpoint.
+    """
+    summary = {
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'folders_processed': 0,
+        'folders_inserted': 0,
+        'documents_processed': 0,
+        'pdfs_folder_updated': 0,
+        'pdf_metadata_upserted': 0,
+        'notes': []
+    }
+
+    if not METADATA_PATH.exists():
+        summary['notes'].append('metadata_store.json not found; nothing to migrate')
+        # write result file
+        try:
+            with open(MIGRATION_RESULT_PATH, 'w', encoding='utf-8') as rf:
+                json.dump(summary, rf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return summary
+
+    data = load_metadata()
+    docs = data.get('documents', {})
+    folders = data.get('folders', [])
+
+    with conn.cursor() as cur:
+        # insert folders if not present
+        for f in folders:
+            summary['folders_processed'] += 1
+            try:
+                # try to insert with provided id (ON CONFLICT DO NOTHING)
+                cur.execute("INSERT INTO folders (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", (int(f.get('id')), f.get('name')))
+                if cur.rowcount:
+                    summary['folders_inserted'] += 1
+                else:
+                    # If no row affected, try a plain insert (fallback)
+                    pass
+            except Exception:
+                try:
+                    cur.execute("INSERT INTO folders (name) VALUES (%s)", (f.get('name'),))
+                    if cur.rowcount:
+                        summary['folders_inserted'] += 1
+                except Exception:
+                    summary['notes'].append(f"failed to insert folder: {f}")
+        conn.commit()
+
+        # migrate each document metadata
+        for pdf_id_str, meta in docs.items():
+            try:
+                pid = int(pdf_id_str)
+            except Exception:
+                continue
+            summary['documents_processed'] += 1
+            # folderId
+            folderId = meta.get('folderId')
+            if folderId:
+                try:
+                    cur.execute("UPDATE pdfs SET folder_id = %s WHERE id = %s", (folderId, pid))
+                    summary['pdfs_folder_updated'] += cur.rowcount if cur.rowcount else 0
+                except Exception:
+                    summary['notes'].append(f"failed to update folder for pdf {pid}")
+            # other metadata: call upsert (we count it as processed)
+            try:
+                upsert_pdf_metadata_db(pid, {'favorite': meta.get('favorite', False), 'tags': meta.get('tags', []), 'uploadedAt': meta.get('uploadedAt')})
+                summary['pdf_metadata_upserted'] += 1
+            except Exception:
+                summary['notes'].append(f"failed to upsert metadata for pdf {pid}")
+        conn.commit()
+
+    # write summary to file for status endpoint
+    try:
+        with open(MIGRATION_RESULT_PATH, 'w', encoding='utf-8') as rf:
+            json.dump(summary, rf, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    return summary
+
+
+# Optional one-time migration from metadata_store.json into DB at startup
+def migrate_metadata_to_db():
+    if os.getenv('MIGRATE_METADATA', 'false').lower() != 'true':
+        return
+    # run the more featureful migration that produces a summary
+    run_migration()
+
+
+migrate_metadata_to_db()
 
 def extract_text_from_pdf(file_path):
     text = ""
@@ -182,3 +374,154 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         answer = "No se pudo generar respuesta."
 
     return {"response": answer}
+
+
+# --- Metadata endpoints for frontend sync (folders, favorites, tags) ---
+@app.get("/metadata/")
+async def get_metadata():
+    # Aggregate folders and documents metadata from DB
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM folders ORDER BY id DESC")
+        folders = [{'id': r[0], 'name': r[1]} for r in cur.fetchall()]
+        # fetch pdf ids
+        cur.execute("SELECT id FROM pdfs")
+        pdf_rows = cur.fetchall()
+    docs = {}
+    for (pid,) in pdf_rows:
+        meta = get_pdf_metadata_from_db(pid)
+        if meta:
+            docs[str(pid)] = meta
+        else:
+            docs[str(pid)] = {}
+    return {'folders': folders, 'documents': docs}
+
+
+@app.post('/migration/run')
+async def migration_run():
+    """Force migration run and return summary JSON."""
+    summary = run_migration()
+    return summary
+
+
+@app.get('/migration/status')
+async def migration_status():
+    """Return last migration result summary if present, otherwise a quick DB check."""
+    if MIGRATION_RESULT_PATH.exists():
+        try:
+            with open(MIGRATION_RESULT_PATH, 'r', encoding='utf-8') as rf:
+                data = json.load(rf)
+                return {'status': 'ok', 'result': data}
+        except Exception:
+            pass
+
+    # Fallback: quick check of counts
+    with conn.cursor() as cur:
+        cur.execute('SELECT COUNT(*) FROM pdfs')
+        pdfs_count = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*) FROM pdf_metadata')
+        meta_count = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*) FROM folders')
+        folders_count = cur.fetchone()[0]
+
+    return {'status': 'ok', 'pdfs': pdfs_count, 'pdf_metadata': meta_count, 'folders': folders_count}
+
+
+@app.post("/folders/")
+async def create_folder(name: str = Form(...)):
+    # create folder in DB
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO folders (name) VALUES (%s) RETURNING id, name", (name,))
+        row = cur.fetchone()
+        conn.commit()
+    folder = {"id": row[0], "name": row[1]}
+    return folder
+
+
+@app.delete("/folders/{folder_id}")
+async def delete_folder(folder_id: int):
+    # delete folder from DB and unset folder_id on pdfs
+    with conn.cursor() as cur:
+        cur.execute("UPDATE pdfs SET folder_id = NULL WHERE folder_id = %s", (folder_id,))
+        cur.execute("DELETE FROM folders WHERE id = %s", (folder_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/documents/{pdf_id}/metadata")
+async def get_document_metadata(pdf_id: int):
+    # Return metadata for a single PDF from DB
+    with conn.cursor() as cur:
+        cur.execute("SELECT folder_id FROM pdfs WHERE id = %s", (pdf_id,))
+        r = cur.fetchone()
+        folder_val = r[0] if r else None
+    meta = get_pdf_metadata_from_db(pdf_id)
+    result = meta or {}
+    result['folderId'] = folder_val
+    return result
+
+
+@app.post("/documents/{pdf_id}/metadata")
+async def set_document_metadata(pdf_id: int, metadata: str = Form(...)):
+    # metadata: JSON string with keys like favorite, tags, folderId
+    try:
+        meta_obj = json.loads(metadata)
+    except Exception:
+        meta_obj = {}
+    # If folderId present, update DB
+    if 'folderId' in meta_obj:
+        folder_id = meta_obj.get('folderId')
+        with conn.cursor() as cur:
+            cur.execute("UPDATE pdfs SET folder_id = %s WHERE id = %s", (folder_id, pdf_id))
+            conn.commit()
+
+    # Store other metadata in DB table pdf_metadata
+    meta_to_store = {k: v for k, v in meta_obj.items() if k != 'folderId'}
+    if meta_to_store:
+        upsert_pdf_metadata_db(pdf_id, meta_to_store)
+
+    # Return merged view
+    with conn.cursor() as cur:
+        cur.execute("SELECT folder_id FROM pdfs WHERE id = %s", (pdf_id,))
+        r = cur.fetchone()
+        folder_val = r[0] if r else None
+    meta = get_pdf_metadata_from_db(pdf_id)
+    result = meta or {}
+    result['folderId'] = folder_val
+    return result
+
+
+@app.get("/pdfs/")
+async def list_pdfs(folder_id: int = None):
+    # Fetch PDFs from database with folder_id
+    with conn.cursor() as cur:
+        if folder_id is None:
+            cur.execute("SELECT id, filename, embedding_type, folder_id FROM pdfs ORDER BY id DESC")
+        else:
+            cur.execute("SELECT id, filename, embedding_type, folder_id FROM pdfs WHERE folder_id = %s ORDER BY id DESC", (folder_id,))
+        rows = cur.fetchall()
+
+    results = []
+    for r in rows:
+        pdf_id, filename, embedding_type, folder_val = r
+        meta = get_pdf_metadata_from_db(pdf_id)
+        entry = {
+            'id': pdf_id,
+            'name': filename,
+            'embeddingType': embedding_type,
+            'folderId': folder_val,
+            'favorite': meta.get('favorite', False),
+            'tags': meta.get('tags', []),
+            'uploadedAt': meta.get('uploadedAt')
+        }
+        results.append(entry)
+
+    return {'pdfs': results}
+
+
+@app.get('/folders/')
+async def list_folders():
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM folders ORDER BY id DESC")
+        rows = cur.fetchall()
+    folders = [{'id': r[0], 'name': r[1]} for r in rows]
+    return {'folders': folders}

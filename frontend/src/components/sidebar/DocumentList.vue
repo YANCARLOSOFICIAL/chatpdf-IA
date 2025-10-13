@@ -29,11 +29,22 @@
         class="doc-item"
         :class="{ 'active': activeDocumentId === doc.id }"
         @click="$emit('select', doc)"
+        draggable="true"
+        @dragstart="(e) => { e.dataTransfer.setData('text/plain', doc.id); e.dataTransfer.effectAllowed = 'move'; }"
+        @dragend="(e) => { /* placeholder for potential cleanup */ }"
       >
         <span class="doc-icon">📄</span>
         <div class="doc-info">
           <div class="doc-name" v-html="highlightText(doc.name)"></div>
           <div class="doc-date">{{ doc.date }}</div>
+        </div>
+
+        <div class="doc-actions">
+          <button class="tag-btn" @click="openTags(doc, $event)" title="Tags">🏷️</button>
+          <button class="fav-btn" @click="toggleFavorite(doc, $event)" :title="doc.favorite ? 'Quitar favorito' : 'Marcar favorito'">
+            <span v-if="doc.favorite">⭐</span>
+            <span v-else>☆</span>
+          </button>
         </div>
       </div>
 
@@ -60,9 +71,18 @@ export default {
     activeDocumentId: {
       type: [String, Number],
       default: null
+    },
+    // Filtrar por carpeta
+    activeFolderId: {
+      type: [String, Number],
+      default: null
+    },
+    showFavorites: {
+      type: Boolean,
+      default: false
     }
   },
-  emits: ['select'],
+  emits: ['select', 'toggle-favorite', 'open-tags'],
   data() {
     return {
       searchQuery: ''
@@ -70,14 +90,32 @@ export default {
   },
   computed: {
     filteredDocuments() {
-      if (!this.searchQuery.trim()) {
-        return this.documents;
+      let docs = this.documents || [];
+
+      // Filtrar por carpeta si se indica
+      if (this.activeFolderId) {
+        docs = docs.filter(d => (d.folderId || null) === this.activeFolderId);
       }
-      
-      const query = this.searchQuery.toLowerCase().trim();
-      return this.documents.filter(doc => 
-        doc.name.toLowerCase().includes(query)
-      );
+
+      // Filtrar por favoritos si se solicita
+      if (this.showFavorites) {
+        docs = docs.filter(d => d.favorite);
+      }
+
+      // Filtrar por búsqueda
+      if (this.searchQuery.trim()) {
+        const query = this.searchQuery.toLowerCase().trim();
+        docs = docs.filter(doc => doc.name.toLowerCase().includes(query));
+      }
+
+      // Orden simple: favoritos primero
+      docs = docs.slice().sort((a, b) => {
+        const aFav = a.favorite ? 0 : 1;
+        const bFav = b.favorite ? 0 : 1;
+        return aFav - bFav;
+      });
+
+      return docs;
     }
   },
   methods: {
@@ -96,6 +134,15 @@ export default {
       const query = this.searchQuery.trim();
       const regex = new RegExp(`(${query})`, 'gi');
       return text.replace(regex, '<mark>$1</mark>');
+    }
+  ,
+    toggleFavorite(doc, ev) {
+      ev.stopPropagation();
+      this.$emit('toggle-favorite', doc.id);
+    },
+    openTags(doc, ev) {
+      ev.stopPropagation();
+      this.$emit('open-tags', doc.id);
     }
   }
 };
@@ -234,6 +281,24 @@ export default {
   color: #6b7280;
   margin-top: 4px;
 }
+
+.doc-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.fav-btn, .tag-btn {
+  background: transparent;
+  border: none;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 6px;
+  border-radius: 6px;
+}
+
+.fav-btn:hover, .tag-btn:hover { background: #1e2640; color: #4d6cfa; }
 
 .empty-docs {
   padding: 32px 16px;
