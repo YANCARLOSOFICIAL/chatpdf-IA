@@ -33,6 +33,17 @@
 </template>
 
 <script>
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
+
+// Configurar marked para mejor renderizado
+marked.setOptions({
+  breaks: true, // Convertir \n en <br>
+  gfm: true, // GitHub Flavored Markdown
+  headerIds: false,
+  mangle: false
+});
+
 export default {
   name: 'ChatMessage',
   props: {
@@ -57,19 +68,19 @@ export default {
       return date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
     },
     formattedContent() {
-      // Aquí podemos agregar markdown rendering más adelante
-      return this.escapeHtml(this.message.content)
-        .replace(/\n/g, '<br>')
-        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.*?)\*/g, '<em>$1</em>')
-        .replace(/`(.*?)`/g, '<code>$1</code>');
-    }
-  },
-  methods: {
-    escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
+      try {
+        // Convertir markdown a HTML usando marked
+        const html = marked.parse(this.message.content || '');
+        // Sanitizar HTML para prevenir XSS (si DOMPurify está disponible)
+        if (typeof DOMPurify !== 'undefined' && DOMPurify.sanitize) {
+          return DOMPurify.sanitize(html);
+        }
+        return html;
+      } catch (error) {
+        console.error('Error parsing markdown:', error);
+        // Fallback a texto plano
+        return this.message.content.replace(/\n/g, '<br>');
+      }
     }
   }
 };
@@ -148,6 +159,86 @@ export default {
   border-radius: 4px;
   font-family: 'Courier New', monospace;
   font-size: 14px;
+}
+
+/* Bloques de código */
+.message-text :deep(pre) {
+  background: #0a0e27;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid #1e2640;
+}
+
+.message-text :deep(pre code) {
+  background: transparent;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Listas */
+.message-text :deep(ul),
+.message-text :deep(ol) {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+
+.message-text :deep(li) {
+  margin: 4px 0;
+}
+
+/* Enlaces */
+.message-text :deep(a) {
+  color: #4d6cfa;
+  text-decoration: underline;
+  transition: color 0.2s;
+}
+
+.message-text :deep(a:hover) {
+  color: #5a7bff;
+}
+
+/* Tablas */
+.message-text :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.message-text :deep(th),
+.message-text :deep(td) {
+  border: 1px solid #2a3152;
+  padding: 8px;
+  text-align: left;
+}
+
+.message-text :deep(th) {
+  background: #1e2640;
+  font-weight: 600;
+}
+
+/* Citas */
+.message-text :deep(blockquote) {
+  border-left: 3px solid #4d6cfa;
+  padding-left: 12px;
+  margin: 8px 0;
+  color: #9ca3af;
+  font-style: italic;
+}
+
+/* Párrafos */
+.message-text :deep(p) {
+  margin: 8px 0;
+}
+
+.message-text :deep(p:first-child) {
+  margin-top: 0;
+}
+
+.message-text :deep(p:last-child) {
+  margin-bottom: 0;
 }
 
 .message.user .message-text {

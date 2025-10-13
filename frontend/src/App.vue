@@ -38,6 +38,29 @@
         @select="selectDocument"
       />
 
+      <!-- Botón para ver historial de conversaciones -->
+      <div v-if="currentDocument" class="history-section">
+        <button 
+          class="history-btn"
+          @click="showConversationsPanel = !showConversationsPanel"
+          :class="{ 'active': showConversationsPanel }"
+        >
+          <span class="icon">📚</span>
+          <span>Historial de Conversaciones</span>
+          <span class="badge" v-if="conversations.length > 0">{{ conversations.length }}</span>
+        </button>
+      </div>
+
+      <!-- Conversaciones del documento actual (colapsable) -->
+      <ConversationList
+        v-if="currentDocument && showConversationsPanel && conversations.length > 0"
+        :conversations="conversations"
+        :active-conversation-id="currentConversationId"
+        @select="selectConversation"
+        @new="newConversation"
+        @delete="deleteConversation"
+      />
+
       <!-- Footer -->
       <div class="sidebar-footer">
         <button class="footer-btn" @click="toggleTheme">
@@ -74,9 +97,16 @@
             <span class="name">{{ currentDocument.name }}</span>
           </div>
         </div>
-        <div class="doc-pages">
-          <span class="icon">📑</span>
-          <span>{{ currentDocument.pages }} páginas</span>
+        <div class="doc-actions">
+          <div class="doc-pages">
+            <span class="icon">📑</span>
+            <span>{{ currentDocument.pages }} páginas</span>
+          </div>
+          <ExportButton 
+            :messages="messages"
+            :document-name="currentDocument.name"
+            @export="handleExport"
+          />
         </div>
       </header>
 
@@ -124,14 +154,15 @@
           <!-- Input Area -->
           <div class="input-area">
             <div class="input-wrapper">
-              <input 
+              <textarea
                 v-model="messageInput"
-                type="text"
-                placeholder="Haz una pregunta sobre el documento..."
-                @keyup.enter="sendMessage"
+                placeholder="Haz una pregunta sobre el documento... (Ctrl+Enter para enviar)"
+                @keydown="handleInputKeydown"
                 :disabled="isSending"
                 class="message-input"
-              />
+                rows="1"
+                ref="messageTextarea"
+              ></textarea>
               <button 
                 class="send-btn"
                 @click="sendMessage"
@@ -146,6 +177,10 @@
                 <span class="icon">📁</span>
                 <span>Cambiar PDF</span>
               </button>
+              <div class="keyboard-hints">
+                <span class="hint"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> para enviar</span>
+                <span class="hint"><kbd>Ctrl</kbd> + <kbd>N</kbd> para nuevo chat</span>
+              </div>
             </div>
           </div>
         </div>
@@ -159,28 +194,40 @@
       :type="toast.type"
       @close="toast.show = false"
     />
+
+    <!-- Shortcuts Modal -->
+    <ShortcutsModal
+      :visible="showShortcutsModal"
+      @close="showShortcutsModal = false"
+    />
   </div>
 </template>
 
 <script>
 import DragOverlay from './components/ui/DragOverlay.vue';
 import DocumentList from './components/sidebar/DocumentList.vue';
+import ConversationList from './components/sidebar/ConversationList.vue';
 import UploadArea from './components/chat/UploadArea.vue';
 import WelcomeMessage from './components/chat/WelcomeMessage.vue';
 import ChatMessage from './components/chat/ChatMessage.vue';
 import TypingIndicator from './components/chat/TypingIndicator.vue';
 import ToastNotification from './components/ui/ToastNotification.vue';
+import ExportButton from './components/chat/ExportButton.vue';
+import ShortcutsModal from './components/ui/ShortcutsModal.vue';
 
 export default {
   name: 'App',
   components: {
     DragOverlay,
     DocumentList,
+    ConversationList,
     UploadArea,
     WelcomeMessage,
     ChatMessage,
     TypingIndicator,
-    ToastNotification
+    ToastNotification,
+    ExportButton,
+    ShortcutsModal
   },
   data() {
     return {
@@ -205,12 +252,20 @@ export default {
       isTyping: false,
       copiedMessageIndex: null,
 
+      // Conversations
+      conversations: [],
+      currentConversationId: null,
+      showConversationsPanel: false,
+
       // Toast
       toast: {
         show: false,
         message: '',
         type: 'info'
-      }
+      },
+
+      // Modals
+      showShortcutsModal: false
     };
   },
 
@@ -218,13 +273,16 @@ export default {
     this.checkMobile();
     window.addEventListener('resize', this.checkMobile);
     this.loadRecentDocuments();
+    this.loadConversations();
     this.loadTheme();
     this.setupDragAndDrop();
+    this.setupKeyboardShortcuts();
   },
 
   beforeUnmount() {
     window.removeEventListener('resize', this.checkMobile);
     this.removeDragAndDrop();
+    this.removeKeyboardShortcuts();
   },
 
   methods: {
@@ -369,6 +427,9 @@ export default {
         }
         this.saveRecentDocuments();
 
+        // Cargar conversaciones del nuevo documento
+        this.loadConversations();
+
         this.showToastMessage('PDF subido exitosamente', 'success');
         
         setTimeout(() => {
@@ -384,9 +445,19 @@ export default {
     },
 
     selectDocument(doc) {
+      // Guardar conversación actual antes de cambiar de documento
+      if (this.messages.length > 0 && this.currentDocument) {
+        this.saveCurrentConversation();
+      }
+
       this.currentDocument = doc;
       this.messages = [];
+      this.currentConversationId = null;
       this.embeddingType = doc.embeddingType || 'openai';
+      
+      // Cargar conversaciones del nuevo documento
+      this.loadConversations();
+      
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
@@ -406,14 +477,123 @@ export default {
     },
 
     startNewChat() {
+      // Guardar conversación actual si hay mensajes
+      if (this.messages.length > 0 && this.currentDocument) {
+        this.saveCurrentConversation();
+      }
+
+      // Crear nueva conversación
+      this.currentConversationId = null;
       this.messages = [];
       this.messageInput = '';
+      
       if (!this.currentDocument) {
         this.showToastMessage('Sube un PDF para comenzar', 'info');
       }
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
+    },
+
+    // Conversation Methods
+    loadConversations() {
+      if (!this.currentDocument) {
+        this.conversations = [];
+        return;
+      }
+
+      const stored = localStorage.getItem(`conversations_${this.currentDocument.id}`);
+      this.conversations = stored ? JSON.parse(stored) : [];
+    },
+
+    saveCurrentConversation() {
+      if (!this.currentDocument || this.messages.length === 0) return;
+
+      const conversation = {
+        id: this.currentConversationId || Date.now(),
+        title: this.generateConversationTitle(),
+        messages: this.messages,
+        messageCount: this.messages.length,
+        date: new Date().toLocaleDateString('es-ES'),
+        timestamp: new Date()
+      };
+
+      // Actualizar o agregar conversación
+      const index = this.conversations.findIndex(c => c.id === conversation.id);
+      if (index !== -1) {
+        this.conversations[index] = conversation;
+      } else {
+        this.conversations.unshift(conversation);
+      }
+
+      // Limitar a 20 conversaciones por documento
+      if (this.conversations.length > 20) {
+        this.conversations = this.conversations.slice(0, 20);
+      }
+
+      // Guardar en localStorage
+      localStorage.setItem(
+        `conversations_${this.currentDocument.id}`,
+        JSON.stringify(this.conversations)
+      );
+
+      this.currentConversationId = conversation.id;
+    },
+
+    generateConversationTitle() {
+      // Usar el primer mensaje del usuario como título
+      const firstUserMessage = this.messages.find(m => m.role === 'user');
+      if (firstUserMessage) {
+        const title = firstUserMessage.content.slice(0, 40);
+        return title.length < firstUserMessage.content.length ? title + '...' : title;
+      }
+      return `Conversación ${new Date().toLocaleTimeString('es-ES')}`;
+    },
+
+    selectConversation(conversation) {
+      // Guardar conversación actual antes de cambiar
+      if (this.messages.length > 0 && this.currentConversationId) {
+        this.saveCurrentConversation();
+      }
+
+      // Cargar conversación seleccionada
+      this.currentConversationId = conversation.id;
+      this.messages = conversation.messages || [];
+      this.showToastMessage(`Conversación cargada: ${conversation.title}`, 'info');
+
+      // Cerrar el panel de conversaciones después de seleccionar
+      this.showConversationsPanel = false;
+
+      if (this.isMobile) {
+        this.sidebarOpen = false;
+      }
+    },
+
+    newConversation() {
+      this.startNewChat();
+      this.showConversationsPanel = false;
+    },
+
+    deleteConversation(conversationId) {
+      if (!confirm('¿Estás seguro de eliminar esta conversación?')) return;
+
+      this.conversations = this.conversations.filter(c => c.id !== conversationId);
+      
+      // Guardar cambios
+      if (this.currentDocument) {
+        localStorage.setItem(
+          `conversations_${this.currentDocument.id}`,
+          JSON.stringify(this.conversations)
+        );
+      }
+
+      // Si se eliminó la conversación actual, limpiar
+      if (this.currentConversationId === conversationId) {
+        this.messages = [];
+        this.currentConversationId = null;
+      }
+
+      this.showToastMessage('Conversación eliminada', 'success');
     },
 
     // Chat Methods
@@ -432,7 +612,12 @@ export default {
       this.isSending = true;
       this.isTyping = true;
 
+      // Reset textarea height
       this.$nextTick(() => {
+        const textarea = this.$refs.messageTextarea;
+        if (textarea) {
+          textarea.style.height = 'auto';
+        }
         this.scrollToBottom();
       });
 
@@ -460,6 +645,9 @@ export default {
         };
 
         this.messages.push(assistantMessage);
+        
+        // Auto-guardar conversación después de cada respuesta
+        this.saveCurrentConversation();
         
         this.$nextTick(() => {
           this.scrollToBottom();
@@ -558,7 +746,81 @@ export default {
     },
 
     openHelp() {
-      this.showToastMessage('Ayuda - Próximamente', 'info');
+      this.showShortcutsModal = true;
+    },
+
+    handleExport({ format, filename }) {
+      this.showToastMessage(`Conversación exportada como ${format.toUpperCase()}`, 'success');
+      console.log('Exported:', filename);
+    },
+
+    // Keyboard Shortcuts
+    setupKeyboardShortcuts() {
+      this.handleKeydown = (e) => {
+        // Ctrl/Cmd + N: Nuevo chat
+        if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
+          e.preventDefault();
+          this.startNewChat();
+        }
+        
+        // Ctrl/Cmd + K: Enfocar búsqueda de documentos
+        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+          e.preventDefault();
+          const searchInput = document.querySelector('.search-input');
+          if (searchInput) searchInput.focus();
+        }
+        
+        // ?: Mostrar atajos de teclado
+        if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          // Solo si no está escribiendo en un input
+          const activeElement = document.activeElement;
+          if (activeElement.tagName !== 'INPUT' && activeElement.tagName !== 'TEXTAREA') {
+            e.preventDefault();
+            this.showShortcutsModal = true;
+          }
+        }
+        
+        // Escape: Cancelar/cerrar
+        if (e.key === 'Escape') {
+          // Cerrar modal si está abierto
+          if (this.showShortcutsModal) {
+            this.showShortcutsModal = false;
+          }
+          // Si hay un documento abierto, cerrar
+          else if (this.currentDocument) {
+            this.closeDocument();
+          }
+        }
+        
+        // Ctrl/Cmd + Enter: Enviar mensaje (se maneja en el textarea)
+        // Implementado directamente en el textarea del chat
+      };
+      
+      window.addEventListener('keydown', this.handleKeydown);
+    },
+
+    removeKeyboardShortcuts() {
+      if (this.handleKeydown) {
+        window.removeEventListener('keydown', this.handleKeydown);
+      }
+    },
+
+    handleInputKeydown(e) {
+      // Ctrl/Cmd + Enter: Enviar mensaje
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        this.sendMessage();
+        return;
+      }
+      
+      // Auto-resize textarea
+      this.$nextTick(() => {
+        const textarea = this.$refs.messageTextarea;
+        if (textarea) {
+          textarea.style.height = 'auto';
+          textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+      });
     }
   }
 };
@@ -637,6 +899,24 @@ export default {
 
 #app.light-mode .sidebar-footer {
   border-top-color: #e2e8f0;
+}
+
+#app.light-mode .history-section {
+  border-top-color: #e2e8f0;
+}
+
+#app.light-mode .history-btn {
+  border-color: #e2e8f0;
+  color: #1a202c;
+}
+
+#app.light-mode .history-btn:hover {
+  background: #f7fafc;
+}
+
+#app.light-mode .history-btn.active {
+  background: #edf2f7;
+  color: #4d6cfa;
 }
 
 #app.light-mode .main-header {
@@ -876,6 +1156,56 @@ export default {
   font-size: 18px;
 }
 
+/* History Section */
+.history-section {
+  padding: 12px 20px;
+  border-top: 1px solid #2a3152;
+}
+
+.history-btn {
+  width: 100%;
+  padding: 12px 16px;
+  background: transparent;
+  border: 1px solid #2a3152;
+  border-radius: 8px;
+  color: #e4e6eb;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.history-btn:hover {
+  background: #1e2640;
+  border-color: #4d6cfa;
+}
+
+.history-btn.active {
+  background: #1e2640;
+  border-color: #4d6cfa;
+  color: #4d6cfa;
+}
+
+.history-btn .icon {
+  font-size: 16px;
+}
+
+.history-btn .badge {
+  margin-left: auto;
+  background: #4d6cfa;
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+  min-width: 20px;
+  text-align: center;
+}
+
 /* Recent Documents */
 .recent-docs {
   flex: 1;
@@ -1057,6 +1387,13 @@ export default {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.doc-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
 }
 
 .doc-pages {
@@ -1490,10 +1827,33 @@ export default {
   font-size: 15px;
   padding: 12px 16px;
   font-family: inherit;
+  resize: none;
+  min-height: 44px;
+  max-height: 200px;
+  line-height: 1.5;
+  overflow-y: auto;
 }
 
 .message-input::placeholder {
   color: #6b7280;
+}
+
+/* Scrollbar para el textarea */
+.message-input::-webkit-scrollbar {
+  width: 6px;
+}
+
+.message-input::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.message-input::-webkit-scrollbar-thumb {
+  background: #2a3152;
+  border-radius: 3px;
+}
+
+.message-input::-webkit-scrollbar-thumb:hover {
+  background: #4d6cfa;
 }
 
 .send-btn {
@@ -1526,7 +1886,33 @@ export default {
   max-width: 1000px;
   margin: 16px auto 0;
   display: flex;
-  justify-content: center;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.keyboard-hints {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.keyboard-hints .hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.keyboard-hints kbd {
+  padding: 2px 6px;
+  background: #1e2640;
+  border: 1px solid #2a3152;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: #e4e6eb;
 }
 
 .btn-change-pdf {
