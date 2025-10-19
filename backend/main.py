@@ -1,5 +1,7 @@
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+import shutil
 import hashlib
 import logging
 from fastapi.middleware.cors import CORSMiddleware
@@ -699,6 +701,16 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
     # Create PDF entry first to get pdf_id for image storage
     pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
     logger.info("Created PDF entry with id=%d", pdf_id)
+    # Persist the uploaded PDF immediately so it is always available for viewing
+    try:
+        uploads_pdf_dir = Path(__file__).resolve().parent / 'uploads' / 'pdfs'
+        uploads_pdf_dir.mkdir(parents=True, exist_ok=True)
+        dest_pdf = uploads_pdf_dir / f"{pdf_id}.pdf"
+        # Use copy2 so the original temp file remains available for processing
+        shutil.copy2(tmp_path, str(dest_pdf))
+        logger.info("Copied uploaded PDF to permanent storage: %s", dest_pdf)
+    except Exception as e:
+        logger.exception("Failed to persist uploaded PDF to uploads/pdfs: %s", e)
     
     # Extract images and produce OCR + vision captions, append to text
     try:
@@ -763,7 +775,14 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
         logger.info("Final text length after images: %d chars", len(text))
     except Exception as e:
         logger.exception("Error processing images: %s", e)
-    os.remove(tmp_path)
+    # Cleanup: remove the working temp file if it still exists (we already copied it)
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            logger.info("Removed temporary upload file: %s", tmp_path)
+    except Exception:
+        # Best-effort cleanup; do not fail the upload if removal fails
+        logger.warning("Failed to remove temporary upload file: %s", tmp_path)
 
     # Dividir texto en chunks simples
     chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
@@ -926,7 +945,18 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
                 logger.info("PDF '%s': Final text length: %d chars", pdf.filename, len(text))
             except Exception as e:
                 logger.exception("PDF '%s': Error processing images: %s", pdf.filename, e)
-            os.remove(tmp_path)
+                # Move the temp PDF to permanent storage for later viewing
+                try:
+                    uploads_pdf_dir = Path(__file__).resolve().parent / 'uploads' / 'pdfs'
+                    uploads_pdf_dir.mkdir(parents=True, exist_ok=True)
+                    dest_pdf = uploads_pdf_dir / f"{pdf_id}.pdf"
+                    shutil.move(tmp_path, str(dest_pdf))
+                    logger.info("Saved uploaded PDF permanently to: %s", dest_pdf)
+                except Exception:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
             chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
 
@@ -974,6 +1004,10 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         raise HTTPException(status_code=500, detail=f"Error retrieving context for PDF: {e}")
 
     context = "\n".join(chunks)
+
+    # Metadata to return so frontend can show whether vision was used
+    used_vlm_enhanced = False
+    images_analyzed = []
 
     # If context is empty, include a helpful diagnostic message
     if not context.strip():
@@ -1044,6 +1078,9 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         # Default: first 5 images (each tuple is (path, page, caption))
         selected_images = pdf_images[:5]
 
+    # Prepare a list to track which images we actually attach to the VLM call
+    images_added = []
+
     # Generar respuesta en lenguaje natural usando el modelo seleccionado
     if embedding_type == "ollama":
         # Usar Qwen (disponible en Ollama) para generar respuesta
@@ -1085,6 +1122,7 @@ Contexto del documento:
         # VLM-Enhanced Mode: If we have images, use OpenAI Vision to analyze them directly
         if pdf_images and openai_api_key:
             logger.info("Using VLM-enhanced mode with %d images", len(pdf_images))
+            used_vlm_enhanced = True
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
             
@@ -1122,6 +1160,7 @@ Analiza tanto el texto como las imágenes para proporcionar respuestas precisas 
                                 },
                                 "meta": {"page": page_num, "caption": (img_caption or '')[:200]}
                             })
+                            images_added.append(page_num)
                             logger.info("Added image from page %d to VLM request", page_num)
                     except Exception as e:
                         logger.warning("Failed to load image %s: %s", img_path, e)
@@ -1144,6 +1183,9 @@ Analiza tanto el texto como las imágenes para proporcionar respuestas precisas 
                 logger.info("VLM-enhanced response generated successfully")
             except Exception as e:
                 logger.exception("VLM-enhanced mode failed: %s", e)
+                # If VLM failed, mark it and fallback to text-only mode
+                used_vlm_enhanced = False
+                logger.warning("Falling back to text-only mode after VLM failure")
                 # Fallback to text-only mode
                 answer = "Error al procesar imágenes. Intenta de nuevo."
         else:
@@ -1176,7 +1218,10 @@ Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualq
     else:
         answer = "No se pudo generar respuesta."
 
-    return {"response": answer}
+    # Final metadata: images_analyzed are the pages we actually attached
+    images_analyzed = images_added
+
+    return {"response": answer, "used_vlm_enhanced": bool(used_vlm_enhanced and len(images_analyzed) > 0), "images_analyzed": images_analyzed}
 
 
 @app.get('/pdfs/{pdf_id}/debug')
@@ -1376,6 +1421,172 @@ async def list_pdfs(folder_id: int = None, name: str = None, hash: str = None):
         results.append(entry)
 
     return {'pdfs': results}
+
+
+@app.delete('/pdfs/{pdf_id}')
+async def delete_pdf(pdf_id: int):
+    """Delete a PDF and its related data and files.
+    - Removes entries from pdfs, pdf_chunks_{openai,ollama}, pdf_metadata
+    - Collects image paths from pdf_images, then deletes image files and the
+      uploads/images/{pdf_id} directory if present.
+    """
+    image_paths = []
+    try:
+        with conn.cursor() as cur:
+            # collect image paths first
+            try:
+                cur.execute("SELECT image_path FROM pdf_images WHERE pdf_id = %s", (pdf_id,))
+                rows = cur.fetchall()
+                image_paths = [r[0] for r in rows]
+            except Exception:
+                image_paths = []
+
+            # delete chunks (if tables exist)
+            try:
+                cur.execute("DELETE FROM pdf_chunks_openai WHERE pdf_id = %s", (pdf_id,))
+            except Exception:
+                pass
+            try:
+                cur.execute("DELETE FROM pdf_chunks_ollama WHERE pdf_id = %s", (pdf_id,))
+            except Exception:
+                pass
+
+            # delete pdf_metadata row
+            try:
+                cur.execute("DELETE FROM pdf_metadata WHERE pdf_id = %s", (pdf_id,))
+            except Exception:
+                pass
+
+            # finally delete pdf row (this will cascade-delete pdf_images if FK has ON DELETE CASCADE)
+            cur.execute("DELETE FROM pdfs WHERE id = %s", (pdf_id,))
+            conn.commit()
+    except Exception as e:
+        logger.exception("Failed to delete PDF id=%s: %s", pdf_id, e)
+        raise HTTPException(status_code=500, detail=f"Error deleting PDF: {e}")
+
+    # Remove image files from disk
+    from pathlib import Path
+    import shutil
+    for p in image_paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    # Remove the containing directory uploads/images/{pdf_id} if it exists
+    try:
+        images_dir = Path(__file__).resolve().parent / 'uploads' / 'images' / str(pdf_id)
+        if images_dir.exists():
+            shutil.rmtree(images_dir)
+    except Exception:
+        pass
+
+    # Remove the persisted original PDF file if present
+    try:
+        pdf_file = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+        if pdf_file.exists():
+            try:
+                os.remove(str(pdf_file))
+            except Exception:
+                # best-effort: ignore if cannot delete
+                logger.warning('Failed to remove persisted PDF file for id=%s: %s', pdf_id, pdf_file)
+    except Exception:
+        pass
+
+    return {"ok": True}
+
+
+@app.get('/pdfs/{pdf_id}/images/{page_num}')
+async def get_pdf_image(pdf_id: int, page_num: int):
+    """Serve an extracted page image for a PDF if available.
+    This endpoint returns the PNG file saved under uploads/images/{pdf_id}/page_{page_num}.png
+    """
+    try:
+        img_path = Path(__file__).resolve().parent / 'uploads' / 'images' / str(pdf_id) / f'page_{page_num}.png'
+        if not img_path.exists():
+            raise HTTPException(status_code=404, detail='Image not found')
+        return FileResponse(str(img_path), media_type='image/png', headers={"Access-Control-Allow-Origin": "*"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('Failed to serve image for pdf_id=%s page=%s: %s', pdf_id, page_num, e)
+        raise HTTPException(status_code=500, detail='Internal server error')
+
+
+@app.get('/pdfs/{pdf_id}/file')
+async def get_pdf_file(pdf_id: int):
+    """Serve the original uploaded PDF if present."""
+    try:
+        pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+        if pdf_path.exists():
+            return FileResponse(str(pdf_path), media_type='application/pdf', headers={"Access-Control-Allow-Origin": "*"})
+
+        # Fallback: if original PDF missing, try to assemble one from extracted page images
+        images_dir = Path(__file__).resolve().parent / 'uploads' / 'images' / str(pdf_id)
+        if images_dir.exists():
+            imgs = sorted(images_dir.glob('page_*.png'))
+            if imgs:
+                try:
+                    from PIL import Image
+                    import io
+                    # open images and convert to RGB
+                    pil_imgs = []
+                    for p in imgs:
+                        im = Image.open(p)
+                        if im.mode == 'RGBA':
+                            im = im.convert('RGB')
+                        pil_imgs.append(im.copy())
+                        im.close()
+
+                    # save to a temporary PDF file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                        first, rest = pil_imgs[0], pil_imgs[1:]
+                        first.save(tmp_pdf.name, format='PDF', save_all=True, append_images=rest)
+                        tmp_path = tmp_pdf.name
+                    return FileResponse(str(tmp_path), media_type='application/pdf', headers={"Access-Control-Allow-Origin": "*"})
+                except Exception as e:
+                    logger.exception('Failed to assemble PDF from images for id=%s: %s', pdf_id, e)
+
+        # If we reach here, no PDF or images available
+        raise HTTPException(status_code=404, detail='PDF not found')
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('Failed to serve pdf file for id=%s: %s', pdf_id, e)
+        raise HTTPException(status_code=500, detail='Internal server error')
+
+
+@app.get('/pdfs/{pdf_id}/info')
+async def get_pdf_info(pdf_id: int):
+    """Return basic info about the stored PDF: page count and stored images."""
+    try:
+        pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+        pages = 0
+        if pdf_path.exists():
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(str(pdf_path))
+                pages = len(reader.pages)
+            except Exception:
+                pages = 0
+
+        # count images stored
+        images_dir = Path(__file__).resolve().parent / 'uploads' / 'images' / str(pdf_id)
+        images = []
+        if images_dir.exists():
+            for p in sorted(images_dir.glob('page_*.png')):
+                try:
+                    # extract page number
+                    num = int(p.stem.split('_')[-1])
+                except Exception:
+                    num = None
+                images.append({'path': str(p), 'page': num})
+
+        return {'pdf_id': pdf_id, 'pages': pages, 'images': images}
+    except Exception as e:
+        logger.exception('Failed to get pdf info for id=%s: %s', pdf_id, e)
+        raise HTTPException(status_code=500, detail='Internal server error')
 
 
 @app.get('/folders/')

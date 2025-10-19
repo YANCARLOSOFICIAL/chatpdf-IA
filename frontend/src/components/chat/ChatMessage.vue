@@ -8,6 +8,12 @@
     </div>
     <div class="message-bubble">
       <div class="message-text" v-html="formattedContent"></div>
+      <div v-if="message.role === 'assistant' && (message.usedVlmEnhanced || (message.imagesAnalyzed && message.imagesAnalyzed.length>0))" class="vlm-meta">
+        <button class="vlm-badge" @click="$emit('open-image', message.imagesAnalyzed[0])">🖼️ Visión usada</button>
+        <span class="vlm-pages">Páginas analizadas: 
+          <a v-for="(p, idx) in message.imagesAnalyzed" :key="p" href="#" @click.prevent="$emit('open-image', p)">{{ p }}<span v-if="idx < message.imagesAnalyzed.length-1">, </span></a>
+        </span>
+      </div>
       <div class="message-footer">
         <div class="message-time">{{ formattedTime }}</div>
         <button 

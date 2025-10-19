@@ -125,6 +125,17 @@
       </div>
     </aside>
 
+    <!-- PDF History Component -->
+    <PDFHistory
+      :isOpen="showPdfHistory"
+      :pdfs="recentDocuments"
+      :currentPdfId="currentDocument ? currentDocument.id : null"
+      @toggle="() => { showPdfHistory = !showPdfHistory }"
+      @select="selectDocument"
+      @delete="deletePdf"
+      @clear-all="clearAllPdfs"
+    />
+
     <!-- Overlay para cerrar sidebar en móvil -->
     <div 
       v-if="isMobile && sidebarOpen" 
@@ -158,7 +169,7 @@
       </header>
 
       <!-- Chat Area -->
-      <div class="chat-container">
+      <div class="chat-container" :class="{ 'two-column': currentDocument }">
         <!-- Sin documento: Mostrar área de upload -->
         <UploadArea
           v-if="!currentDocument"
@@ -169,8 +180,18 @@
           @error="showToastMessage"
         />
 
+        <!-- Con documento: PDF izquierda + chat derecha -->
+        <div v-if="currentDocument" class="pdf-pane">
+          <PdfViewer 
+            ref="embeddedPdfViewer" 
+            mode="embedded" 
+            :pdfUrl="pdfViewerUrl" 
+            :startPage="pdfViewerStartPage" 
+          />
+        </div>
+
         <!-- Con documento: Mostrar chat -->
-        <div v-else class="chat-area">
+        <div v-if="currentDocument" class="chat-area">
           <!-- Mensajes -->
           <div class="messages-container" ref="messagesContainer">
             <!-- Mensaje de bienvenida -->
@@ -272,6 +293,8 @@ import TypingIndicator from './components/chat/TypingIndicator.vue';
 import ToastNotification from './components/ui/ToastNotification.vue';
 import ExportButton from './components/chat/ExportButton.vue';
 import ShortcutsModal from './components/ui/ShortcutsModal.vue';
+import PdfViewer from './components/PdfViewer.vue';
+import PDFHistory from './components/PDFHistory.vue';
 
 export default {
   name: 'App',
@@ -287,7 +310,9 @@ export default {
     TypingIndicator,
     ToastNotification,
     ExportButton,
-    ShortcutsModal
+    ShortcutsModal,
+    PdfViewer
+    ,PDFHistory
   },
   data() {
     return {
@@ -318,6 +343,7 @@ export default {
       copiedMessageIndex: null,
 
   // Conversations
+    showPdfHistory: false,
       conversations: [],
       currentConversationId: null,
       showConversationsPanel: false,
@@ -336,6 +362,9 @@ export default {
   tagEditorDocId: null,
   // Tag filter
   activeTag: null,
+  // PDF viewer (embedded)
+  pdfViewerUrl: '',
+  pdfViewerStartPage: 1,
 
       // Sidebar helpers
       showConversationsPanel: false
@@ -479,6 +508,43 @@ export default {
           this.saveFolders();
           this.showToastMessage('Carpeta eliminada localmente', 'warning');
         });
+    },
+
+    async deletePdf(pdfId) {
+      if (!confirm('¿Eliminar este PDF y todos sus datos asociados? Esta acción no se puede deshacer.')) return;
+      try {
+        const res = await fetch(`http://localhost:8000/pdfs/${pdfId}`, { method: 'DELETE' });
+        if (res.ok) {
+          this.recentDocuments = this.recentDocuments.filter(d => d.id !== pdfId);
+          if (this.currentDocument && this.currentDocument.id === pdfId) {
+            this.closeDocument();
+          }
+          this.showToastMessage('PDF eliminado', 'info');
+        } else {
+          // If server returned 404 or other, still remove locally to keep UI responsive
+          this.recentDocuments = this.recentDocuments.filter(d => d.id !== pdfId);
+          this.showToastMessage('PDF eliminado localmente (server no respondió OK)', 'warning');
+        }
+      } catch (e) {
+        // Best-effort local removal
+        this.recentDocuments = this.recentDocuments.filter(d => d.id !== pdfId);
+        this.showToastMessage('PDF eliminado localmente (error de red)', 'warning');
+      }
+    },
+
+    async clearAllPdfs() {
+      if (!confirm('¿Eliminar todos los PDFs? Esta acción eliminará permanentemente todos los PDFs en el servidor.')) return;
+      const ids = this.recentDocuments.map(d => d.id);
+      for (const id of ids) {
+        try {
+          await fetch(`http://localhost:8000/pdfs/${id}`, { method: 'DELETE' });
+        } catch (e) {
+          // ignore individual failures
+        }
+      }
+      this.recentDocuments = [];
+      this.closeDocument();
+      this.showToastMessage('Todos los PDFs eliminados', 'info');
     },
 
     selectFolder(folderId) {
@@ -848,7 +914,7 @@ export default {
       }
     },
 
-    selectDocument(doc) {
+    async selectDocument(doc) {
       // Guardar conversación actual antes de cambiar de documento
       if (this.messages.length > 0 && this.currentDocument) {
         this.saveCurrentConversation();
@@ -858,6 +924,22 @@ export default {
       this.messages = [];
       this.currentConversationId = null;
       this.embeddingType = doc.embeddingType || 'openai';
+      
+      // Configurar URL del PDF para el visor embebido
+      try {
+        const base = 'http://localhost:8000'; // usar config si está disponible
+        this.pdfViewerUrl = `${base}/pdfs/${doc.id}/file`;
+        this.pdfViewerStartPage = 1;
+        
+        // Dar tiempo al componente para montarse y luego abrir el PDF
+        this.$nextTick(() => {
+          if (this.$refs.embeddedPdfViewer && typeof this.$refs.embeddedPdfViewer.open === 'function') {
+            this.$refs.embeddedPdfViewer.open();
+          }
+        });
+      } catch (e) {
+        console.warn('Error configurando visor PDF:', e);
+      }
       
       // Cargar conversaciones del nuevo documento
       this.loadConversations();
@@ -1832,6 +1914,45 @@ export default {
   overflow: hidden;
 }
 
+/* Two-column layout: PDF + Chat */
+.chat-container.two-column {
+  flex-direction: row;
+  gap: 0;
+}
+
+.pdf-pane {
+  width: 45%;
+  min-width: 400px;
+  border-right: 1px solid #1e2640;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-container.two-column .chat-area {
+  width: 55%;
+  flex: 1;
+}
+
+/* Responsive: stack vertically on small screens */
+@media (max-width: 1024px) {
+  .chat-container.two-column {
+    flex-direction: column;
+  }
+  
+  .pdf-pane {
+    width: 100%;
+    height: 40vh;
+    border-right: none;
+    border-bottom: 1px solid #1e2640;
+  }
+  
+  .chat-container.two-column .chat-area {
+    width: 100%;
+    height: 60vh;
+  }
+}
+
 /* Upload Section */
 .upload-section {
   flex: 1;
@@ -2604,6 +2725,87 @@ select,
 
 #app.light-mode ::-webkit-scrollbar-thumb:hover {
   background: #a0aec0;
+}
+
+/* ==================== PDF VIEWER EMBEDDED STYLES ==================== */
+.pdf-embedded {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #0a0e27;
+}
+
+.embedded-controls {
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #151934;
+  border-bottom: 1px solid #1e2640;
+  flex-shrink: 0;
+}
+
+.embedded-controls button {
+  padding: 8px 16px;
+  background: #1e2640;
+  border: 1px solid #2a3152;
+  border-radius: 6px;
+  color: #e4e6eb;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.embedded-controls button:hover:not(:disabled) {
+  background: #2a3152;
+  border-color: #4d6cfa;
+}
+
+.embedded-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.embedded-controls span {
+  color: #9ca3af;
+  font-size: 14px;
+}
+
+.embedded-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9ca3af;
+  font-size: 13px;
+}
+
+.embedded-controls input[type="range"] {
+  width: 100px;
+}
+
+.embedded-canvas-wrap {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.embedded-canvas-wrap canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+}
+
+.error-msg {
+  color: #ff7b7b;
+  padding: 12px;
+  text-align: center;
+  font-size: 14px;
 }
 
 /* ==================== ACCESSIBILITY ==================== */
