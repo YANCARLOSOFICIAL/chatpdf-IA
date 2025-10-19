@@ -599,12 +599,18 @@ export default {
 
 
     handleFileSelect(event) {
-      const file = event.target.files[0];
-      if (file && file.type === 'application/pdf') {
-        this.selectedFile = file;
-      } else {
-        this.showToastMessage('Por favor selecciona un archivo PDF válido', 'error');
+      const files = Array.from(event.target.files || []);
+      const pdfs = files.filter(f => f.type === 'application/pdf');
+      if (pdfs.length === 0) {
+        this.showToastMessage('Por favor selecciona al menos un archivo PDF válido', 'error');
         event.target.value = '';
+        return;
+      }
+      if (pdfs.length === 1) {
+        this.selectedFile = pdfs[0];
+      } else {
+        // If multiple selected, start multi-upload flow
+        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f, embeddingType: this.embeddingType })));
       }
     },
 
@@ -653,18 +659,90 @@ export default {
       e.stopPropagation();
       this.isDragging = false;
 
-      const files = e.dataTransfer.files;
-      if (files.length > 0) {
-        const file = files[0];
-        if (file.type === 'application/pdf') {
-          const payload = {
-            file: file,
-            embeddingType: this.embeddingType
-          };
-          this.uploadDocument(payload);
-        } else {
-          this.showToastMessage('Por favor arrastra un archivo PDF válido', 'error');
+      const files = Array.from(e.dataTransfer.files || []);
+      const pdfs = files.filter(f => f.type === 'application/pdf');
+      if (pdfs.length === 0) {
+        this.showToastMessage('Por favor arrastra al menos un archivo PDF válido', 'error');
+        return;
+      }
+      if (pdfs.length === 1) {
+        this.uploadDocument({ file: pdfs[0], embeddingType: this.embeddingType });
+      } else {
+        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f, embeddingType: this.embeddingType })));
+      }
+    },
+
+    async uploadMultipleDocuments(items) {
+      // items: [{file, embeddingType}, ...]
+      const filesToUpload = [];
+      const hashes = [];
+
+      for (const it of items) {
+        try {
+          const arrayBuffer = await it.file.arrayBuffer();
+          const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+          const hashArray = Array.from(new Uint8Array(hashBuffer));
+          const fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+          hashes.push(fileHash);
+          filesToUpload.push({ file: it.file, embeddingType: it.embeddingType, fileHash });
+        } catch (err) {
+          // if hashing fails, include the file without hash
+          hashes.push(null);
+          filesToUpload.push({ file: it.file, embeddingType: it.embeddingType, fileHash: null });
         }
+      }
+
+      // Pre-check duplicates in parallel by querying /pdfs/?hash= for each non-null hash
+      const existingHashes = new Set();
+      await Promise.all(hashes.map(async (h) => {
+        if (!h) return;
+        try {
+          const res = await fetch(`http://localhost:8000/pdfs/?hash=${h}`);
+          if (res.ok) {
+            const d = await res.json();
+            if (d.pdfs && d.pdfs.length > 0) {
+              existingHashes.add(h);
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }));
+
+      // Build FormData for upload_pdfs endpoint, skipping duplicates
+      const form = new FormData();
+      form.append('embedding_type', this.embeddingType);
+      const fileHashesForForm = [];
+      for (const f of filesToUpload) {
+        if (f.fileHash && existingHashes.has(f.fileHash)) {
+          this.showToastMessage(`Omitido (duplicado): ${f.file.name}`, 'warning');
+          continue;
+        }
+        form.append('pdfs', f.file, f.file.name);
+        if (f.fileHash) form.append('file_hashes', f.fileHash);
+      }
+
+      try {
+        this.isUploading = true;
+        const response = await fetch('http://localhost:8000/upload_pdfs/', { method: 'POST', body: form });
+        const data = await response.json();
+        if (data && data.results) {
+          data.results.forEach(r => {
+            if (r.status === 'uploaded') {
+              this.showToastMessage(`Subido: ${r.filename}`, 'success');
+              // Optionally add to recentDocuments
+              this.recentDocuments.unshift({ id: r.pdf_id, name: r.filename, pages: 0, uploadedAt: new Date().toISOString(), embeddingType: this.embeddingType, folderId: null, favorite: false, tags: [] });
+            } else if (r.status === 'duplicate') {
+              this.showToastMessage(`Omitido (duplicado): ${r.filename}`, 'warning');
+            } else {
+              this.showToastMessage(`Error subiendo ${r.filename}: ${r.detail || 'unknown'}`, 'error');
+            }
+          });
+          this.saveRecentDocuments();
+        }
+      } catch (err) {
+        console.error(err);
+        this.showToastMessage('Error al subir archivos', 'error');
+      } finally {
+        this.isUploading = false;
       }
     },
 

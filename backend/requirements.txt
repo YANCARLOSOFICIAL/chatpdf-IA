@@ -5,3 +5,8 @@ requests
 psycopg2-binary
 pgvector
 python-dotenv
+Pillow
+pdf2image
+pytesseract
+# Optional: camelot for table extraction (requires ghostscript and opencv installed on the system)
+# camelot-py[cv]

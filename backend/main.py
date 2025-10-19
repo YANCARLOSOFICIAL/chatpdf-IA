@@ -1,6 +1,7 @@
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 import hashlib
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import tempfile
@@ -40,6 +41,10 @@ def save_metadata(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 app = FastAPI()
+
+# Basic logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,6 +94,24 @@ def init_db_schema():
             try:
                 cur.execute("ALTER TABLE pdfs ADD COLUMN hash TEXT")
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS pdfs_hash_idx ON pdfs(hash)")
+            except Exception:
+                pass
+        # create pdf_images table for storing extracted images
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS pdf_images (
+                id SERIAL PRIMARY KEY,
+                pdf_id INTEGER REFERENCES pdfs(id) ON DELETE CASCADE,
+                image_path TEXT NOT NULL,
+                page_number INTEGER,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        # Ensure caption column exists for storing per-image captions
+        try:
+            cur.execute("ALTER TABLE pdf_images ADD COLUMN IF NOT EXISTS caption TEXT")
+        except Exception:
+            try:
+                cur.execute("ALTER TABLE pdf_images ADD COLUMN caption TEXT")
             except Exception:
                 pass
         conn.commit()
@@ -229,16 +252,318 @@ def migrate_metadata_to_db():
 migrate_metadata_to_db()
 
 def extract_text_from_pdf(file_path):
+    """
+    Extract text from PDF. Try PyPDF2 first; if extracted text is very small,
+    fall back to OCR using pdf2image + pytesseract to handle image-based PDFs
+    (scanned documents, math expressions embedded as images, etc.). We also
+    attempt table extraction as a future enhancement (Camelot/Tabula), but
+    that requires system dependencies and is optional.
+    """
     text = ""
-    with open(file_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text += page.extract_text() or ""
+    # Primary extraction using PyPDF2
+    try:
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+    except Exception:
+        text = ""
+
+    # If little or no text extracted, try OCR on each page image
+    if not text or len(text.strip()) < 50:
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+            images = convert_from_path(file_path, dpi=200)
+            ocr_text_parts = []
+            for img in images:
+                try:
+                    ocr_text_parts.append(pytesseract.image_to_string(img, lang='eng'))
+                except Exception:
+                    # try without specifying lang
+                    ocr_text_parts.append(pytesseract.image_to_string(img))
+            ocr_text = "\n".join(ocr_text_parts)
+            if ocr_text and len(ocr_text.strip()) > len(text):
+                text = ocr_text
+        except Exception:
+            # pdf2image/pytesseract not available or failed — keep whatever text we have
+            pass
+
+    # NOTE: Table extraction with Camelot or Tabula could be integrated here
+    # to parse tables into text (CSV/TSV) and append to `text`. Camelot needs
+    # system dependencies (ghostscript, opencv) so we leave it as optional.
+
     return text
 
-def get_ollama_embedding(text, model="embeddinggemma"):
+def get_ollama_embedding(text, model="embeddinggemma:latest"):
+    """Call the local Ollama-compatible server but prefer Qwen embedding model
+    names present in the environment. The system lists `embeddinggemma:latest`
+    as available; if Qwen embedding model is desired, set the model argument
+    accordingly when calling this function.
+    """
     response = requests.post(f"http://localhost:11434/api/embeddings", json={"model": model, "prompt": text})
-    return response.json()["embedding"]
+    return response.json().get("embedding")
+
+
+def generate_text_with_qwen(prompt, model="qwen3:4b"):
+    """Synchronous generate call to local Ollama (Qwen). Returns plain text if available."""
+    try:
+        resp = requests.post("http://localhost:11434/api/generate", json={"model": model, "prompt": prompt})
+        if resp.ok:
+            data = resp.json()
+            # Ollama generate responses commonly include 'response' field
+            return data.get('response') or data.get('text') or ''
+    except Exception:
+        pass
+    return ''
+
+
+def extract_images_from_pdf(file_path, pdf_id=None):
+    """Extract page images from a PDF using pdf2image (if available).
+    If pdf_id is provided, saves images permanently in uploads/images/{pdf_id}/ directory.
+    Returns a list of tuples: [(image_path, page_number), ...]
+    """
+    try:
+        from pdf2image import convert_from_path
+    except Exception as e:
+        logger.warning("pdf2image not available: %s", e)
+        return []
+    images = []
+    try:
+        logger.info("Extracting images from PDF: %s", file_path)
+        pil_images = convert_from_path(file_path, dpi=200)
+        logger.info("Extracted %d page images", len(pil_images))
+        
+        # Determine where to save images
+        if pdf_id:
+            # Permanent storage in uploads/images/{pdf_id}/
+            base_dir = Path(__file__).resolve().parent / 'uploads' / 'images' / str(pdf_id)
+            base_dir.mkdir(parents=True, exist_ok=True)
+            delete_after = False
+        else:
+            # Temporary storage (legacy behavior)
+            base_dir = Path(tempfile.gettempdir())
+            delete_after = True
+        
+        for i, img in enumerate(pil_images):
+            if pdf_id:
+                img_path = base_dir / f"page_{i+1}.png"
+                img.save(str(img_path), format='PNG')
+                images.append((str(img_path), i+1))  # Return tuple with page number
+                logger.info("Saved page %d image permanently to: %s", i+1, img_path)
+            else:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_page_{i}.png")
+                img.save(tmp.name, format='PNG')
+                images.append((tmp.name, i+1))
+                logger.info("Saved page %d image to temp: %s", i+1, tmp.name)
+    except Exception as e:
+        logger.exception("Failed to extract images from PDF: %s", e)
+        return []
+    return images
+
+
+def ocr_image_file(path):
+    try:
+        import pytesseract
+        from PIL import Image
+        # Configure Tesseract path for Windows
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+        logger.info("Running OCR on image: %s", path)
+        result = pytesseract.image_to_string(Image.open(path)) or ''
+        logger.info("OCR result length: %d chars", len(result))
+        return result
+    except Exception as e:
+        # Log as warning instead of exception to reduce noise
+        logger.warning("OCR unavailable or failed for image %s: %s", path, str(e))
+        return ''
+
+
+def generate_image_with_qwen(image_path, prompt, model="qwen2.5vl:latest"):
+    """Send an image to a local Ollama vision-capable model. Returns the generated text.
+    Tries both /api/chat (preferred for vision) and /api/generate as fallback.
+    """
+    try:
+        import base64
+        logger.info("Generating caption for image: %s with model: %s", image_path, model)
+        with open(image_path, 'rb') as f:
+            b = f.read()
+        b64 = base64.b64encode(b).decode('ascii')
+        logger.info("Image encoded to base64, length: %d chars", len(b64))
+        
+        # Try /api/chat endpoint first (better for vision models in newer Ollama)
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "images": [b64]
+                    }
+                ],
+                "stream": False
+            }
+            resp = requests.post("http://localhost:11434/api/chat", 
+                               json=payload,
+                               timeout=30)
+            logger.info("Ollama /api/chat response status: %d", resp.status_code)
+            if resp.ok:
+                data = resp.json()
+                result = data.get('message', {}).get('content', '') or data.get('response', '')
+                if result:
+                    logger.info("Caption generated via /api/chat, length: %d chars", len(result))
+                    return result
+            else:
+                logger.warning("Ollama /api/chat failed: %s", resp.text[:500])
+        except Exception as e:
+            logger.warning("Failed /api/chat, trying fallback: %s", e)
+        
+        # Fallback: try /api/generate with markdown image tag
+        combined_prompt = f"![image](data:image/png;base64,{b64})\n\n{prompt}"
+        resp = requests.post("http://localhost:11434/api/generate", 
+                           json={"model": model, "prompt": combined_prompt, "stream": False},
+                           timeout=30)
+        logger.info("Ollama /api/generate response status: %d", resp.status_code)
+        if resp.ok:
+            data = resp.json()
+            result = data.get('response') or data.get('text') or ''
+            logger.info("Caption generated via /api/generate, length: %d chars", len(result))
+            return result
+        else:
+            logger.warning("Ollama /api/generate also failed: %s", resp.text[:500])
+            
+    except Exception as e:
+        logger.exception("Failed to generate image caption: %s", e)
+        return ''
+    return ''
+
+
+def generate_image_with_openai(image_path, prompt, openai_api_key, model="gpt-4o-mini"):
+    """Generate a caption/analysis for an image using OpenAI chat endpoint by embedding
+    the image as a data URI in a markdown image tag inside the user message. Falls back
+    cleanly on errors and returns empty string on failure.
+    """
+    try:
+        import base64
+        from PIL import Image
+        from io import BytesIO
+
+        # Load and normalize image
+        img = Image.open(image_path).convert('RGB')
+
+        # Resize/compress thumbnail to reduce token cost
+        max_dim = 512
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=30, optimize=True)
+        b = buf.getvalue()
+        b64 = base64.b64encode(b).decode('ascii')
+
+        # If still too large, skip OpenAI and let caller fallback
+        if len(b64) > 100000:
+            logger.warning("Compressed image base64 still large (%d chars). Skipping OpenAI caption.", len(b64))
+            return ''
+
+        user_content = f"![image](data:image/jpeg;base64,{b64})\n\n{prompt}"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are an assistant that describes images succinctly and extracts any visible text, formulas or chart summaries."},
+                {"role": "user", "content": user_content}
+            ],
+            "max_tokens": 300,
+            "temperature": 0.0
+        }
+
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        text_snippet = ''
+        try:
+            text_snippet = resp.text[:2000]
+        except Exception:
+            text_snippet = '<unreadable response body>'
+
+        if resp.ok:
+            try:
+                j = resp.json()
+            except Exception:
+                logger.warning("OpenAI caption: response ok but JSON decode failed; raw: %s", text_snippet)
+                return ''
+
+            content = ''
+            if isinstance(j, dict):
+                try:
+                    content = j.get('choices', [])[0].get('message', {}).get('content', '')
+                except Exception:
+                    content = ''
+                if not content:
+                    try:
+                        content = j.get('output_text') or j.get('output', '')
+                    except Exception:
+                        content = ''
+
+            logger.info("OpenAI caption response keys: %s", list(j.keys()) if isinstance(j, dict) else type(j))
+            if content:
+                logger.info("OpenAI caption generated, length=%d", len(content))
+                return content
+            else:
+                logger.warning("OpenAI caption: no textual content found in response; raw: %s", text_snippet)
+        else:
+            # If OpenAI returns a context length error, treat as non-fatal and fallback
+            try:
+                jerr = resp.json()
+                err_code = jerr.get('error', {}).get('code')
+                if err_code == 'context_length_exceeded':
+                    logger.warning("OpenAI context length exceeded for image; skipping OpenAI caption. Raw: %s", text_snippet)
+                    return ''
+            except Exception:
+                pass
+            logger.warning("OpenAI caption request failed (status %s): %s", resp.status_code, text_snippet)
+
+    except Exception as e:
+        logger.exception("OpenAI caption generation failed: %s", e)
+
+    return ''
+
+
+@app.post('/admin/test_image_caption/')
+async def admin_test_image_caption(image: UploadFile = File(...), provider: str = Form('openai')):
+    """Upload a single image and return caption from OpenAI or Ollama. Useful for debugging.
+    provider: 'openai' or 'ollama'
+    """
+    # save temp file
+    try:
+        data = await image.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(image.filename)[1] or '.png') as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded image: {e}")
+
+    result = {'provider': provider, 'filename': image.filename}
+    try:
+        prompt = "Describe this image briefly and highlight important visual elements. If there are any texts, formulas or charts, summarize them."
+        if provider == 'openai':
+            openai_api_key = os.getenv('OPENAI_API_KEY', '')
+            if not openai_api_key:
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY not configured')
+            cap = generate_image_with_openai(tmp_path, prompt, openai_api_key)
+            result['caption'] = cap
+        else:
+            cap = generate_image_with_qwen(tmp_path, prompt)
+            result['caption'] = cap
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return result
 
 def get_qwen_embedding(text, api_key):
     url = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding"
@@ -367,12 +692,81 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
+    
     text = extract_text_from_pdf(tmp_path)
+    logger.info("Extracted base text length: %d chars", len(text))
+    
+    # Create PDF entry first to get pdf_id for image storage
+    pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
+    logger.info("Created PDF entry with id=%d", pdf_id)
+    
+    # Extract images and produce OCR + vision captions, append to text
+    try:
+        # Pass pdf_id to save images permanently
+        image_data = extract_images_from_pdf(tmp_path, pdf_id=pdf_id)
+        logger.info("Found %d images in PDF", len(image_data))
+
+        ocr_texts = []
+        captions = []
+        # Check if OCR and vision captions are enabled via env var. If OPENAI_API_KEY
+        # is present, prefer OpenAI captions automatically (they are higher quality)
+        openai_api_key = os.getenv('OPENAI_API_KEY', '')
+        enable_ocr = os.getenv('ENABLE_OCR', 'true').lower() == 'true'  # OCR enabled by default
+        enable_vision = os.getenv('ENABLE_VISION_CAPTIONS', 'false').lower() == 'true' or bool(openai_api_key)
+        logger.info("Vision captions enabled=%s; OPENAI_API_KEY present=%s", enable_vision, bool(openai_api_key))
+
+        for image_path, page_num in image_data:
+            # Save image reference to database
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pdf_images (pdf_id, image_path, page_number) VALUES (%s, %s, %s)",
+                    (pdf_id, image_path, page_num)
+                )
+                conn.commit()
+            logger.info("Saved image reference for page %d: %s", page_num, image_path)
+            
+            # Only run OCR if enabled and Tesseract is available
+            if enable_ocr:
+                ocr_result = ocr_image_file(image_path)
+                if ocr_result and len(ocr_result.strip()) > 10:
+                    ocr_texts.append(ocr_result)
+                    logger.info("OCR text added: %d chars", len(ocr_result))
+
+            # Only generate captions if enabled (can be slow / costly with many images)
+            if enable_vision:
+                try:
+                    caption_prompt = "Describe this image briefly and highlight important visual elements. If there are any texts, formulas or charts, summarize them."
+                    cap = ''
+                    # Prefer OpenAI Vision (chat completions with embedded data URI) when API key is present
+                    if openai_api_key:
+                        cap = generate_image_with_openai(image_path, caption_prompt, openai_api_key)
+                        if cap:
+                            logger.info("Caption produced by OpenAI for image: %s", image_path)
+                    # Fallback to local Ollama if OpenAI not configured or failed
+                    if not cap:
+                        cap = generate_image_with_qwen(image_path, caption_prompt)
+                        if cap:
+                            logger.info("Caption produced by Ollama for image: %s", image_path)
+
+                    if cap and len(cap.strip()) > 0:
+                        captions.append(cap)
+                        logger.info("Caption added: %d chars", len(cap))
+                except Exception as e:
+                    logger.warning("Skipping caption for image due to error: %s", e)
+
+        if ocr_texts:
+            text += "\n\n[OCR_EXTRACTED_TEXT]\n" + "\n".join(ocr_texts)
+            logger.info("Appended OCR texts to document")
+        if captions:
+            text += "\n\n[IMAGE_CAPTIONS]\n" + "\n".join(captions)
+            logger.info("Appended image captions to document")
+        logger.info("Final text length after images: %d chars", len(text))
+    except Exception as e:
+        logger.exception("Error processing images: %s", e)
     os.remove(tmp_path)
 
     # Dividir texto en chunks simples
     chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
-    pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     for chunk in chunks:
@@ -386,6 +780,173 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
         save_embedding(pdf_id, chunk, embedding, embedding_type)
 
     return {"filename": pdf.filename, "embedding_type": embedding_type, "pdf_id": pdf_id}
+
+
+@app.post('/upload_pdfs/')
+async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = Form(...), file_hashes: list[str] | None = Form(None)):
+    """Accept multiple PDF uploads in one request. Returns per-file results.
+    Expect multiple 'pdf' files and optionally multiple 'file_hashes' values in the same order.
+    """
+    results = []
+    # Normalize file_hashes
+    if file_hashes is None:
+        file_hashes = [None] * len(pdfs)
+
+    for idx, pdf in enumerate(pdfs):
+        fh = None
+        if idx < len(file_hashes):
+            fh = file_hashes[idx]
+
+        try:
+            file_bytes = await pdf.read()
+            computed_hash = hashlib.sha256(file_bytes).hexdigest()
+            file_hash = fh or computed_hash
+
+            # Quick check by hash
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM pdfs WHERE hash = %s", (file_hash,))
+                if cur.fetchone():
+                    results.append({'filename': pdf.filename, 'status': 'duplicate', 'reason': 'hash_exists'})
+                    continue
+
+            # Filename check
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM pdfs WHERE filename = %s", (pdf.filename,))
+                if cur.fetchone():
+                    results.append({'filename': pdf.filename, 'status': 'duplicate', 'reason': 'filename_exists'})
+                    continue
+
+            # Chunk-based heuristic for existing rows
+            with conn.cursor() as cur_all:
+                cur_all.execute("SELECT id, hash FROM pdfs")
+                all_rows = cur_all.fetchall()
+
+            matched_existing = False
+            for existing_id, stored_hash in all_rows:
+                if stored_hash == file_hash:
+                    matched_existing = True
+                    break
+
+                # compute chunk hash
+                chunks = []
+                with conn.cursor() as cur2:
+                    try:
+                        cur2.execute("SELECT chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (existing_id,))
+                        chunks += [r[0] for r in cur2.fetchall()]
+                    except Exception:
+                        pass
+                    try:
+                        cur2.execute("SELECT chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (existing_id,))
+                        chunks += [r[0] for r in cur2.fetchall()]
+                    except Exception:
+                        pass
+
+                if not chunks:
+                    continue
+
+                combined = ''.join([c or '' for c in chunks])
+                chunk_hash = hashlib.sha256(combined.encode('utf-8')).hexdigest()
+                if chunk_hash == file_hash:
+                    # update existing row
+                    with conn.cursor() as cur3:
+                        cur3.execute("UPDATE pdfs SET hash = %s WHERE id = %s", (file_hash, existing_id))
+                        conn.commit()
+                    matched_existing = True
+                    break
+
+            if matched_existing:
+                results.append({'filename': pdf.filename, 'status': 'duplicate', 'reason': 'matched_by_chunks'})
+                continue
+
+            # If new, create entry and save embeddings
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            text = extract_text_from_pdf(tmp_path)
+            logger.info("PDF '%s': Extracted base text length: %d chars", pdf.filename, len(text))
+            
+            # Create PDF entry first to get pdf_id for image storage
+            pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
+            logger.info("PDF '%s': Created PDF entry with id=%d", pdf.filename, pdf_id)
+            
+            # Extract images and produce OCR + vision captions, append to text
+            try:
+                # Pass pdf_id to save images permanently
+                image_data = extract_images_from_pdf(tmp_path, pdf_id=pdf_id)
+                logger.info("PDF '%s': Found %d images", pdf.filename, len(image_data))
+                ocr_texts = []
+                captions = []
+                openai_api_key = os.getenv('OPENAI_API_KEY', '')
+                enable_ocr = os.getenv('ENABLE_OCR', 'true').lower() == 'true'  # OCR enabled by default
+                enable_vision = os.getenv('ENABLE_VISION_CAPTIONS', 'false').lower() == 'true' or bool(openai_api_key)
+                logger.info("Vision captions enabled=%s; OPENAI_API_KEY present=%s", enable_vision, bool(openai_api_key))
+                
+                for image_path, page_num in image_data:
+                    # Save image reference to database
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO pdf_images (pdf_id, image_path, page_number) VALUES (%s, %s, %s)",
+                            (pdf_id, image_path, page_num)
+                        )
+                        conn.commit()
+                    logger.info("PDF '%s': Saved image reference for page %d: %s", pdf.filename, page_num, image_path)
+                    
+                    # Only run OCR if enabled and Tesseract is available
+                    if enable_ocr:
+                        ocr_result = ocr_image_file(image_path)
+                        if ocr_result and len(ocr_result.strip()) > 10:
+                            ocr_texts.append(ocr_result)
+                            logger.info("OCR text added: %d chars", len(ocr_result))
+                    
+                    # Only generate captions if enabled (can be slow/costly with many images)
+                    if enable_vision:
+                        try:
+                            caption_prompt = "Describe this image briefly and highlight important visual elements. If there are any texts, formulas or charts, summarize them."
+                            cap = ''
+                            if openai_api_key:
+                                cap = generate_image_with_openai(image_path, caption_prompt, openai_api_key)
+                                if cap:
+                                    logger.info("Caption produced by OpenAI for image: %s", image_path)
+                            if not cap:
+                                cap = generate_image_with_qwen(image_path, caption_prompt)
+                                if cap:
+                                    logger.info("Caption produced by Ollama for image: %s", image_path)
+                            if cap and len(cap.strip()) > 0:
+                                captions.append(cap)
+                                logger.info("Caption added: %d chars", len(cap))
+                        except Exception as e:
+                            logger.warning("Skipping caption for image due to error: %s", e)
+                
+                if ocr_texts:
+                    text += "\n\n[OCR_EXTRACTED_TEXT]\n" + "\n".join(ocr_texts)
+                    logger.info("PDF '%s': Appended OCR texts", pdf.filename)
+                if captions:
+                    text += "\n\n[IMAGE_CAPTIONS]\n" + "\n".join(captions)
+                    logger.info("PDF '%s': Appended image captions", pdf.filename)
+                logger.info("PDF '%s': Final text length: %d chars", pdf.filename, len(text))
+            except Exception as e:
+                logger.exception("PDF '%s': Error processing images: %s", pdf.filename, e)
+            os.remove(tmp_path)
+
+            chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+
+            openai_api_key = os.getenv("OPENAI_API_KEY", "")
+            for chunk in chunks:
+                if embedding_type == "ollama":
+                    embedding = get_ollama_embedding(chunk)
+                elif embedding_type == "openai":
+                    embedding = get_openai_embedding(chunk, openai_api_key)
+                else:
+                    raise Exception("Tipo de embedding no soportado")
+                save_embedding(pdf_id, chunk, embedding, embedding_type)
+
+            results.append({'filename': pdf.filename, 'status': 'uploaded', 'pdf_id': pdf_id})
+        except HTTPException as he:
+            results.append({'filename': pdf.filename, 'status': 'error', 'detail': str(he.detail)})
+        except Exception as e:
+            results.append({'filename': pdf.filename, 'status': 'error', 'detail': str(e)})
+
+    return {'results': results}
 
 
 @app.post("/chat/")
@@ -406,14 +967,100 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         query_embedding = get_openai_embedding(query, openai_api_key)
     else:
         raise Exception("Tipo de embedding no soportado")
-    chunks = search_similar_chunks(pdf_id, query_embedding, embedding_type)
+    try:
+        chunks = search_similar_chunks(pdf_id, query_embedding, embedding_type)
+    except Exception as e:
+        logger.exception("Error searching similar chunks for pdf_id=%s", pdf_id)
+        raise HTTPException(status_code=500, detail=f"Error retrieving context for PDF: {e}")
+
     context = "\n".join(chunks)
+
+    # If context is empty, include a helpful diagnostic message
+    if not context.strip():
+        # collect some diagnostics
+        with conn.cursor() as cur:
+            cur.execute("SELECT hash, embedding_type FROM pdfs WHERE id = %s", (pdf_id,))
+            pdf_row = cur.fetchone()
+        pdf_hash = pdf_row[0] if pdf_row else None
+        pdf_embed_type = pdf_row[1] if pdf_row else None
+        # count chunks available
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM pdf_chunks_ollama WHERE pdf_id = %s", (pdf_id,))
+            ollama_chunks = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM pdf_chunks_openai WHERE pdf_id = %s", (pdf_id,))
+            openai_chunks = cur.fetchone()[0]
+
+        detail = {
+            'message': 'No context available for this PDF. It may have failed ingestion or OCR/captions were empty.',
+            'pdf_id': pdf_id,
+            'hash': pdf_hash,
+            'pdf_embedding_type': pdf_embed_type,
+            'chunks_ollama': ollama_chunks,
+            'chunks_openai': openai_chunks
+        }
+        logger.info("Empty context diagnostics: %s", detail)
+        raise HTTPException(status_code=404, detail=detail)
+
+    # VLM-Enhanced Query Mode: Check if PDF has images stored in DB
+    # If yes, load them and their stored captions for summaries. We'll also support
+    # selective image loading when the user mentions a specific page number ("página 2").
+    pdf_images = []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT image_path, page_number, caption FROM pdf_images WHERE pdf_id = %s ORDER BY page_number",
+            (pdf_id,)
+        )
+        pdf_images = cur.fetchall()
+
+    if pdf_images:
+        logger.info("VLM-Enhanced mode activated: found %d images for pdf_id=%d", len(pdf_images), pdf_id)
+    else:
+        logger.info("No images found for pdf_id=%d, using text-only mode", pdf_id)
+
+    # Build a short per-page summary block so captions aren't lost in chunk boundaries
+    image_summaries = []
+    for img_path, page_num, caption in pdf_images:
+        short = (caption or '').strip()
+        if not short:
+            short = f"Imagen en página {page_num}: sin descripción disponible."
+        image_summaries.append(f"Página {page_num}: {short}")
+    if image_summaries:
+        # Prepend an explicit marker so models see per-page summaries early
+        context = "\n[IMAGE_SUMMARIES]\n" + "\n".join(image_summaries) + "\n\n" + context
+
+    # Detect explicit page reference in the user's query (e.g. "página 2")
+    import re
+    page_refs = re.findall(r"p(?:á|a)gina\s*(\d+)", query.lower())
+    requested_pages = [int(p) for p in page_refs] if page_refs else []
+
+    # Select which images to attach to the VLM request.
+    if requested_pages:
+        # Filter images to only those requested by page number
+        selected_images = [t for t in pdf_images if t[1] in requested_pages]
+        if not selected_images:
+            # If requested pages not found, fall back to first 3 images
+            selected_images = pdf_images[:3]
+    else:
+        # Default: first 5 images (each tuple is (path, page, caption))
+        selected_images = pdf_images[:5]
 
     # Generar respuesta en lenguaje natural usando el modelo seleccionado
     if embedding_type == "ollama":
-        # Usar Ollama para generar respuesta
-        ollama_model = "llama2:7b-chat"  # Usar el modelo conversacional instalado
-        prompt = f"Responde en lenguaje natural a la pregunta: '{query}' usando el siguiente contexto extraído del documento:\n{context}"
+        # Usar Qwen (disponible en Ollama) para generar respuesta
+        ollama_model = "qwen3:4b"  # modelo conversacional instalado en Ollama
+        prompt = f"""Responde en lenguaje natural a la pregunta del usuario usando el contexto extraído del documento.
+
+El contexto puede incluir:
+- Texto extraído directamente del PDF
+- Texto extraído vía OCR de imágenes (marcado con [OCR_EXTRACTED_TEXT])
+- Descripciones visuales de imágenes generadas por IA (marcado con [IMAGE_CAPTIONS])
+
+Si la pregunta es sobre imágenes, diagramas, gráficos o elementos visuales, usa las descripciones disponibles en [IMAGE_CAPTIONS] para responder de manera precisa y detallada.
+
+Pregunta: {query}
+
+Contexto del documento:
+{context}"""
         ollama_response = requests.post(
             "http://localhost:11434/api/generate",
             json={"model": ollama_model, "prompt": prompt},
@@ -435,21 +1082,151 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         if not answer:
             answer = "No se pudo generar respuesta."
     elif embedding_type == "openai":
-        # Usar OpenAI para generar respuesta
-        openai_model = "gpt-3.5-turbo"  # Cambia por el modelo que prefieras
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
-        messages = [
-            {"role": "system", "content": "Responde en lenguaje natural y de forma explicativa usando el contexto proporcionado."},
-            {"role": "user", "content": f"Pregunta: {query}\nContexto: {context}"}
-        ]
-        payload = {"model": openai_model, "messages": messages, "max_tokens": 256}
-        openai_response = requests.post(url, json=payload, headers=headers)
-        answer = openai_response.json().get("choices", [{}])[0].get("message", {}).get("content", "No se pudo generar respuesta.")
+        # VLM-Enhanced Mode: If we have images, use OpenAI Vision to analyze them directly
+        if pdf_images and openai_api_key:
+            logger.info("Using VLM-enhanced mode with %d images", len(pdf_images))
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
+            
+            # Build messages array with text + images
+            system_prompt = """Eres un asistente experto que responde preguntas sobre documentos PDF con contenido multimodal.
+
+Tienes acceso a:
+1. El texto extraído del documento (incluye OCR si es necesario)
+2. Las imágenes originales del documento
+
+Analiza tanto el texto como las imágenes para proporcionar respuestas precisas y detalladas. Cuando veas gráficos, diagramas, tablas o cualquier elemento visual, descríbelos específicamente y úsalos para responder la pregunta del usuario."""
+            
+            # Create user message with text context
+            user_content = [
+                {"type": "text", "text": f"Pregunta: {query}\n\nContexto del documento:\n{context}"}
+            ]
+            
+            # Add images (from selected_images which respects page refs)
+            for img_path, page_num, img_caption in selected_images:
+                if os.path.exists(img_path):
+                    try:
+                        # Read and encode image
+                        import base64
+                        with open(img_path, 'rb') as img_file:
+                            img_data = img_file.read()
+                        base64_img = base64.b64encode(img_data).decode('utf-8')
+                        
+                        # Skip if image is too large
+                        if len(base64_img) < 100000:  # ~100KB limit
+                            user_content.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_img}",
+                                    "detail": "high"
+                                },
+                                "meta": {"page": page_num, "caption": (img_caption or '')[:200]}
+                            })
+                            logger.info("Added image from page %d to VLM request", page_num)
+                    except Exception as e:
+                        logger.warning("Failed to load image %s: %s", img_path, e)
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
+            
+            payload = {
+                "model": "gpt-4o-mini",  # Vision-capable model
+                "messages": messages,
+                "max_tokens": 500
+            }
+            
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                answer = response.json()["choices"][0]["message"]["content"]
+                logger.info("VLM-enhanced response generated successfully")
+            except Exception as e:
+                logger.exception("VLM-enhanced mode failed: %s", e)
+                # Fallback to text-only mode
+                answer = "Error al procesar imágenes. Intenta de nuevo."
+        else:
+            # Text-only mode (legacy)
+            logger.info("Using text-only mode (no images or no API key)")
+            openai_model = "gpt-4-turbo"  # Cambia por el modelo que prefieras
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
+            system_prompt = """Eres un asistente que responde preguntas sobre documentos PDF.
+
+El contexto que recibes puede incluir:
+- Texto extraído directamente del PDF
+- Texto extraído vía OCR de imágenes (marcado con [OCR_EXTRACTED_TEXT])
+- Descripciones visuales detalladas de imágenes, diagramas y gráficos generadas por IA de visión (marcado con [IMAGE_CAPTIONS])
+
+Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualquier elemento visual del documento, usa las descripciones disponibles en las secciones [IMAGE_CAPTIONS] para proporcionar respuestas precisas y detalladas. No digas que no puedes ver las imágenes; en su lugar, usa las descripciones visuales proporcionadas en el contexto."""
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Pregunta: {query}\n\nContexto del documento:\n{context}"}
+            ]
+            payload = {"model": openai_model, "messages": messages, "max_tokens": 256}
+            
+            try:
+                openai_response = requests.post(url, json=payload, headers=headers, timeout=30)
+                openai_response.raise_for_status()
+                answer = openai_response.json().get("choices", [{}])[0].get("message", {}).get("content", "No se pudo generar respuesta.")
+            except Exception as e:
+                logger.exception("OpenAI text-only mode failed: %s", e)
+                answer = "Error al generar respuesta. Intenta de nuevo."
     else:
         answer = "No se pudo generar respuesta."
 
     return {"response": answer}
+
+
+@app.get('/pdfs/{pdf_id}/debug')
+async def pdf_debug(pdf_id: int):
+    """Return debugging info for a PDF: stored chunks, OCR/captions markers, hash and metadata counts."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, filename, embedding_type, hash, folder_id FROM pdfs WHERE id = %s", (pdf_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        pdf_info = {'id': row[0], 'filename': row[1], 'embedding_type': row[2], 'hash': row[3], 'folder_id': row[4]}
+
+    # fetch chunks from both chunk tables
+    chunks_ollama = []
+    chunks_openai = []
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT id, chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+            chunks_ollama = [{'id': r[0], 'chunk': r[1]} for r in cur.fetchall()]
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT id, chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+            chunks_openai = [{'id': r[0], 'chunk': r[1]} for r in cur.fetchall()]
+        except Exception:
+            pass
+
+    # Try to detect OCR/IMAGE caption markers inside chunks
+    ocr_snippets = []
+    caption_snippets = []
+    for c in chunks_ollama + chunks_openai:
+        ch = c.get('chunk') or ''
+        if '[OCR_EXTRACTED_TEXT]' in ch:
+            ocr_snippets.append(ch[ch.find('[OCR_EXTRACTED_TEXT]'):][:1000])
+        if '[IMAGE_CAPTIONS]' in ch:
+            caption_snippets.append(ch[ch.find('[IMAGE_CAPTIONS]'):][:1000])
+
+    # metadata
+    meta = get_pdf_metadata_from_db(pdf_id)
+
+    return {
+        'pdf': pdf_info,
+        'metadata': meta,
+        'chunks_ollama_count': len(chunks_ollama),
+        'chunks_openai_count': len(chunks_openai),
+        'ocr_snippets': ocr_snippets,
+        'caption_snippets': caption_snippets,
+        'chunks_ollama_sample': chunks_ollama[:3],
+        'chunks_openai_sample': chunks_openai[:3]
+    }
 
 
 # --- Metadata endpoints for frontend sync (folders, favorites, tags) ---
