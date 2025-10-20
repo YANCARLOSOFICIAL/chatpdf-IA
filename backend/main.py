@@ -753,6 +753,10 @@ def sanitize_suggested_questions_from_text(txt, max_q=3):
         # Ensure it ends with a question mark
         if not s.endswith('?'):
             s = s + '?'
+        # Discard too-short results (avoid returning just punctuation)
+        core = re.sub(r'[^\wÁÉÍÓÚÜÑáéíóúüñ]', '', s)
+        if len(core) < 3:
+            return ''
         return s
 
     def extract_question_lines(text):
@@ -1701,16 +1705,31 @@ async def suggest_questions(pdf_id: int):
     for provider in provider_pref:
         if provider == 'ollama':
             try:
-                logger.info('suggest_questions: trying Ollama for pdf_id=%s', pdf_id)
-                resp = requests.post('http://localhost:11434/api/generate', json={'model': 'qwen3:4b', 'prompt': followup_prompt}, timeout=8)
-                if resp.ok:
-                    try:
+                logger.info('suggest_questions: trying Ollama (/api/chat) for pdf_id=%s', pdf_id)
+                # Prefer the /api/chat endpoint for cleaner text responses
+                payload = {
+                    'model': 'qwen3:4b',
+                    'messages': [{'role': 'user', 'content': followup_prompt}],
+                    'stream': False
+                }
+                try:
+                    resp = requests.post('http://localhost:11434/api/chat', json=payload, timeout=8)
+                    if resp.ok:
                         jr = resp.json()
-                        txt = jr.get('response') or jr.get('text') or ''
-                    except Exception:
-                        txt = resp.text
+                        # Ollama chat tends to put text in message.content
+                        txt = (jr.get('message', {}) or {}).get('content') or jr.get('response') or jr.get('text') or ''
+                except Exception:
+                    # Fallback to /api/generate if /api/chat isn't available
+                    logger.info('suggest_questions: /api/chat failed, falling back to /api/generate for pdf_id=%s', pdf_id)
+                    resp = requests.post('http://localhost:11434/api/generate', json={'model': 'qwen3:4b', 'prompt': followup_prompt, 'stream': False}, timeout=8)
+                    if resp.ok:
+                        try:
+                            jr = resp.json()
+                            txt = jr.get('response') or jr.get('text') or ''
+                        except Exception:
+                            txt = resp.text
             except Exception as e:
-                logger.warning('suggest_questions: Ollama call failed: %s', e)
+                logger.warning('suggest_questions: Ollama call failed completely: %s', e)
         else:
             if not openai_api_key:
                 continue
