@@ -83,6 +83,7 @@
         @toggle-favorite="toggleFavorite"
         @open-tags="openTagsPanel"
         @remove-tag="removeTagFromDoc"
+        @delete="deletePdf"
       />
 
       <!-- Botón para ver historial de conversaciones -->
@@ -196,6 +197,12 @@
           <div class="messages-container" ref="messagesContainer">
             <!-- Mensaje de bienvenida -->
             <WelcomeMessage v-if="messages.length === 0" />
+            <div v-if="messages.length === 0 && suggestedQuestions && suggestedQuestions.length" class="suggested-questions">
+              <div class="sugg-title">Sugerencias:</div>
+              <div class="sugg-list">
+                <button v-for="(q, qi) in suggestedQuestions" :key="qi" class="sugg-btn" @click="sendSuggested(q)">{{ q }}</button>
+              </div>
+            </div>
 
             <!-- Mensajes del chat -->
             <div v-else class="messages-list">
@@ -207,7 +214,17 @@
                 :show-regenerate-btn="index === messages.length - 1"
                 @copy="copyMessage(index, $event)"
                 @regenerate="regenerateLastMessage"
+                @go-to-source="handleGoToSource"
               />
+              <!-- Suggested questions quick buttons (rendered below assistant messages) -->
+              <div v-for="(msg, idx) in messages" :key="'sugg-'+idx">
+                <div v-if="msg.role === 'assistant' && msg.suggestedQuestions && msg.suggestedQuestions.length" class="suggested-questions">
+                  <div class="sugg-title">Sugerencias:</div>
+                  <div class="sugg-list">
+                    <button v-for="(q, qi) in msg.suggestedQuestions" :key="qi" class="sugg-btn" @click="sendSuggested(q)">{{ q }}</button>
+                  </div>
+                </div>
+              </div>
 
               <!-- Typing indicator -->
               <div v-if="isTyping" class="message assistant">
@@ -367,7 +384,9 @@ export default {
   pdfViewerStartPage: 1,
 
       // Sidebar helpers
-      showConversationsPanel: false
+      showConversationsPanel: false,
+      // Starter suggested questions fetched when opening a document
+      suggestedQuestions: []
     };
   },
 
@@ -948,6 +967,124 @@ export default {
         this.sidebarOpen = false;
       }
       this.showToastMessage(`Documento "${doc.name}" seleccionado`, 'info');
+
+      // Fetch suggested starter questions for this PDF so they appear immediately
+      try {
+        const res = await fetch(`http://localhost:8000/pdfs/${doc.id}/suggest_questions`);
+        if (!res.ok) {
+          // Try to read text for debugging (could be HTML error page)
+          const txt = await res.text().catch(() => '');
+          console.warn(`Could not fetch suggestions (status ${res.status})`, txt);
+        } else {
+          const ct = (res.headers.get('content-type') || '').toLowerCase();
+          let parsed = null;
+          if (ct.includes('application/json')) {
+            try {
+              parsed = await res.json();
+            } catch (err) {
+              // JSON parse failed despite content-type
+              const txt = await res.text().catch(() => '');
+              console.warn('Failed to parse JSON suggestions, raw text:', txt, err);
+            }
+          } else {
+            // Not JSON content-type: read text and try to extract a JSON array or fallback
+            const txt = await res.text().catch(() => '');
+            // Try to find a JSON array inside the response body
+            try {
+              const m = txt.match(/(\[\s*\".*?\"[\s\S]*?\])/s);
+              if (m) {
+                try {
+                  const arr = JSON.parse(m[1]);
+                  parsed = { suggested_questions: Array.isArray(arr) ? arr : [] };
+                } catch (err) {
+                  // ignore JSON parse error here
+                }
+              }
+            } catch (err) {
+              // ignore
+            }
+            if (!parsed) {
+              // Fallback: try to parse lines that look like questions
+              const lines = txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+              const qlines = lines.filter(l => l.endsWith('?') || l.startsWith('¿') || l.includes('?'));
+              const fallbackQs = qlines.length ? qlines.slice(0,3) : lines.slice(0,3);
+              parsed = { suggested_questions: fallbackQs };
+            }
+          }
+
+          if (parsed && Array.isArray(parsed.suggested_questions)) {
+            // Clean and normalize suggestions: backend sometimes returns model metadata or JSON blobs.
+            const raw = parsed.suggested_questions || [];
+            const cleaned = [];
+            for (let item of raw) {
+              if (!item) continue;
+              let text = '';
+              // If item looks like JSON blob, try to parse and extract useful fields
+              if (typeof item === 'string' && item.trim().startsWith('{')) {
+                try {
+                  const obj = JSON.parse(item);
+                  text = obj.response || obj.text || obj.thinking || '';
+                } catch (e) {
+                  // not strict JSON - try to find a JSON substring
+                  try {
+                    const m = item.match(/\{[\s\S]*\}/);
+                    if (m) {
+                      const obj = JSON.parse(m[0]);
+                      text = obj.response || obj.text || obj.thinking || '';
+                    }
+                  } catch (e2) {
+                    text = item;
+                  }
+                }
+              } else {
+                text = String(item);
+              }
+
+              // Unescape common escaped sequences and trim
+              text = text.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t').replace(/\"/g, '"').trim();
+
+              // Try to extract question-like lines (ending with '?')
+              const qmatches = text.match(/[^\r\n]{10,}?\?/g);
+              if (qmatches && qmatches.length) {
+                for (const q of qmatches) {
+                  const qq = q.trim();
+                  if (qq && cleaned.indexOf(qq) === -1) cleaned.push(qq);
+                  if (cleaned.length >= 3) break;
+                }
+                if (cleaned.length >= 3) break;
+                continue;
+              }
+
+              // Else split by lines and pick lines that contain question marks
+              const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+              let addedFromLines = false;
+              for (const l of lines) {
+                if ((l.endsWith('?') || l.startsWith('¿') || l.includes('?')) && cleaned.indexOf(l) === -1) {
+                  cleaned.push(l.endsWith('?') ? l : l + '?');
+                  addedFromLines = true;
+                }
+                if (cleaned.length >= 3) break;
+              }
+              if (addedFromLines) {
+                if (cleaned.length >= 3) break;
+                continue;
+              }
+
+              // Fallback: take a short snippet as a question-like suggestion
+              const fallback = text.replace(/[{}\[\]"]/g,'').trim();
+              if (fallback && cleaned.indexOf(fallback) === -1) {
+                const short = fallback.length > 120 ? fallback.slice(0,120).trim() + '...' : fallback;
+                cleaned.push(short);
+              }
+              if (cleaned.length >= 3) break;
+            }
+
+            this.suggestedQuestions = cleaned.slice(0,3);
+          }
+        }
+      } catch (e) {
+        console.warn('No se pudieron obtener sugerencias iniciales', e);
+      }
     },
 
     closeDocument() {
@@ -1108,10 +1245,13 @@ export default {
       });
 
       try {
-        const formData = new FormData();
-        formData.append('query', query);
-        formData.append('pdf_id', this.currentDocument.id);
-        formData.append('embedding_type', this.embeddingType);
+  const formData = new FormData();
+  formData.append('query', query);
+  formData.append('pdf_id', this.currentDocument.id);
+  formData.append('embedding_type', this.embeddingType);
+  // Ask backend for suggested questions only for the first assistant response in a new conversation
+  const hasAssistantResponses = this.messages.some(m => m.role === 'assistant');
+  formData.append('include_suggestions', hasAssistantResponses ? '0' : '1');
 
         const response = await fetch('http://localhost:8000/chat/', {
           method: 'POST',
@@ -1127,7 +1267,11 @@ export default {
         const assistantMessage = {
           role: 'assistant',
           content: data.response,
-          timestamp: new Date()
+          timestamp: new Date(),
+          sources: data.sources || [],  // Evidence/provenance from backend
+          usedVlmEnhanced: data.used_vlm_enhanced || false,
+          imagesAnalyzed: data.images_analyzed || [],
+          suggestedQuestions: data.suggested_questions || []
         };
 
         this.messages.push(assistantMessage);
@@ -1307,6 +1451,41 @@ export default {
           textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
         }
       });
+    },
+
+    // Navigate PDF viewer to a specific source/page and show a visual highlight when possible
+    async handleGoToSource(source) {
+      if (!source || !source.page) {
+        this.showToastMessage('Esta fuente no tiene información de página', 'warning');
+        return;
+      }
+
+      const viewer = this.$refs.embeddedPdfViewer;
+      if (!viewer) {
+        this.showToastMessage('El visor PDF no está disponible', 'error');
+        return;
+      }
+
+      try {
+        if (typeof viewer.highlightSource === 'function') {
+          await viewer.highlightSource(source);
+          this.showToastMessage(`Mostrando contexto en página ${source.page}`, 'info');
+        } else if (typeof viewer.goToPage === 'function') {
+          viewer.goToPage(source.page);
+          this.showToastMessage(`Navegando a página ${source.page}`, 'info');
+        }
+      } catch (e) {
+        console.error('handleGoToSource error', e);
+        if (typeof viewer.goToPage === 'function') viewer.goToPage(source.page);
+      }
+    },
+    // Send a suggested question (quick action)
+    async sendSuggested(question) {
+      if (!question) return;
+      // populate input and send
+      this.messageInput = question;
+      await this.$nextTick();
+      this.sendMessage();
     }
   }
 };
@@ -1961,6 +2140,13 @@ export default {
   justify-content: center;
   padding: 32px;
 }
+
+/* Suggested questions */
+.suggested-questions { padding: 8px 16px; }
+.sugg-title { color: #9ca3af; font-size: 12px; margin-bottom: 6px }
+.sugg-list { display:flex; gap:8px; flex-wrap:wrap }
+.sugg-btn { background: #20263f; color:#e4e6eb; border:1px solid #2a3152; padding:6px 10px; border-radius:8px; cursor:pointer }
+.sugg-btn:hover { background:#2a3152; border-color:#4d6cfa; color:#4d6cfa }
 
 .upload-card {
   max-width: 500px;

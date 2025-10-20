@@ -44,13 +44,8 @@
                 </div>
               </div>
               <div class="pdf-item-actions">
-                <button 
-                  @click.stop="$emit('delete', pdf.id)" 
-                  class="delete-btn"
-                  title="Eliminar PDF"
-                >
-                  🗑️
-                </button>
+                <!-- Deletion moved to sidebar document list for a single place of control -->
+                <span class="pdf-item-actions-note" title="Eliminar desde la barra lateral">�️</span>
               </div>
             </div>
           </div>

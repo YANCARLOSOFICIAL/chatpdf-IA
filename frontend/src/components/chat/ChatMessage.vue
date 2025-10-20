@@ -14,6 +14,25 @@
           <a v-for="(p, idx) in message.imagesAnalyzed" :key="p" href="#" @click.prevent="$emit('open-image', p)">{{ p }}<span v-if="idx < message.imagesAnalyzed.length-1">, </span></a>
         </span>
       </div>
+      <!-- Evidence/Source links -->
+      <div v-if="message.role === 'assistant' && message.sources && message.sources.length > 0" class="sources-container">
+        <div class="sources-title">📚 Fuentes:</div>
+        <div class="sources-list">
+          <button 
+            v-for="(source, idx) in message.sources" 
+            :key="idx"
+            class="source-item"
+            @click="$emit('go-to-source', source)"
+            :title="source.preview"
+          >
+            <span class="source-icon">📄</span>
+            <span class="source-label">
+              <span v-if="source.page">Pág. {{ source.page }}</span>
+              <span v-else>Fragmento {{ idx + 1 }}</span>
+            </span>
+          </button>
+        </div>
+      </div>
       <div class="message-footer">
         <div class="message-time">{{ formattedTime }}</div>
         <button 
@@ -66,7 +85,7 @@ export default {
       default: false
     }
   },
-  emits: ['copy', 'regenerate'],
+  emits: ['copy', 'regenerate', 'go-to-source'],
   computed: {
     formattedTime() {
       if (!this.message.timestamp) return '';
@@ -344,5 +363,116 @@ export default {
 :global(#app.light-mode) .copy-btn:hover,
 :global(#app.light-mode) .regenerate-btn:hover {
   background: #f7fafc;
+}
+
+/* Sources styling */
+.sources-container {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(77, 108, 250, 0.05);
+  border: 1px solid #2a3152;
+  border-radius: 8px;
+}
+
+.sources-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #9ca3af;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sources-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.source-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #1e2640;
+  border: 1px solid #2a3152;
+  border-radius: 6px;
+  color: #e4e6eb;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.source-item:hover {
+  background: #2a3152;
+  border-color: #4d6cfa;
+  color: #4d6cfa;
+  transform: translateY(-1px);
+}
+
+.source-icon {
+  font-size: 14px;
+}
+
+.source-label {
+  font-weight: 500;
+}
+
+:global(#app.light-mode) .sources-container {
+  background: rgba(77, 108, 250, 0.05);
+  border-color: #e2e8f0;
+}
+
+:global(#app.light-mode) .sources-title {
+  color: #718096;
+}
+
+:global(#app.light-mode) .source-item {
+  background: #f7fafc;
+  border-color: #e2e8f0;
+  color: #1a202c;
+}
+
+:global(#app.light-mode) .source-item:hover {
+  background: #edf2f7;
+  border-color: #4d6cfa;
+  color: #4d6cfa;
+}
+
+.vlm-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px;
+  background: rgba(77, 108, 250, 0.08);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.vlm-badge {
+  padding: 4px 10px;
+  background: #4d6cfa;
+  border: none;
+  border-radius: 12px;
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.vlm-pages {
+  color: #9ca3af;
+  font-size: 12px;
+}
+
+.vlm-pages a {
+  color: #4d6cfa;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.vlm-pages a:hover {
+  text-decoration: underline;
 }
 </style>

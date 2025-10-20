@@ -51,6 +51,7 @@
             <span v-if="doc.favorite">⭐</span>
             <span v-else>☆</span>
           </button>
+          <button class="delete-btn" @click.stop.prevent="deleteDoc(doc, $event)" title="Eliminar PDF">🗑️</button>
         </div>
       </div>
 
@@ -93,7 +94,7 @@ export default {
       default: false
     }
   },
-  emits: ['select', 'toggle-favorite', 'open-tags', 'remove-tag'],
+  emits: ['select', 'toggle-favorite', 'open-tags', 'remove-tag', 'delete'],
   data() {
     return {
       searchQuery: ''
@@ -159,6 +160,12 @@ export default {
     openTags(doc, ev) {
       ev.stopPropagation();
       this.$emit('open-tags', doc.id);
+    }
+    ,
+    deleteDoc(doc, ev) {
+      ev.stopPropagation();
+      if (!confirm(`¿Eliminar "${doc.name}" y todos sus datos asociados? Esta acción no se puede deshacer.`)) return;
+      this.$emit('delete', doc.id);
     }
   }
 };

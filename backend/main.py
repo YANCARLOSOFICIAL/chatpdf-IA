@@ -116,6 +116,21 @@ def init_db_schema():
                 cur.execute("ALTER TABLE pdf_images ADD COLUMN caption TEXT")
             except Exception:
                 pass
+        # Create table to store per-chunk bounding boxes (PDF coordinates)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS pdf_chunk_spans (
+                id SERIAL PRIMARY KEY,
+                chunk_table TEXT,
+                chunk_id INTEGER,
+                pdf_id INTEGER REFERENCES pdfs(id) ON DELETE CASCADE,
+                page_number INTEGER,
+                x FLOAT,
+                y FLOAT,
+                width FLOAT,
+                height FLOAT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
         conn.commit()
 
 init_db_schema()
@@ -594,7 +609,18 @@ def get_openai_embedding(text, api_key, model="text-embedding-3-large"):
 def save_embedding(pdf_id, chunk, embedding, embedding_type):
     table_name = "pdf_chunks_ollama" if embedding_type == "ollama" else "pdf_chunks_openai"
     with conn.cursor() as cur:
-        cur.execute(f"INSERT INTO {table_name} (pdf_id, chunk, embedding) VALUES (%s, %s, %s)", (pdf_id, chunk, embedding))
+        cur.execute(f"INSERT INTO {table_name} (pdf_id, chunk, embedding) VALUES (%s, %s, %s) RETURNING id", (pdf_id, chunk, embedding))
+        inserted_id = cur.fetchone()[0]
+        conn.commit()
+    return inserted_id
+
+
+def save_chunk_span(chunk_table, chunk_id, pdf_id, page_number, x, y, width, height):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO pdf_chunk_spans (chunk_table, chunk_id, pdf_id, page_number, x, y, width, height) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (chunk_table, chunk_id, pdf_id, page_number, x, y, width, height)
+        )
         conn.commit()
 
 def create_pdf_entry(filename, embedding_type):
@@ -612,6 +638,219 @@ def create_pdf_entry_with_hash(filename, embedding_type, file_hash=None):
         conn.commit()
     return pdf_id
 
+
+def map_chunk_to_bbox(pdf_path, chunk_text, inserted_chunk_id, chunk_table, pdf_id):
+    """Attempt to map a chunk of text back to a page bbox using pdfplumber.
+    Heuristic: for each page, extract words with bbox, join their texts and find the
+    first occurrence of a short snippet from the chunk; use the matched words' boxes
+    to compute a bounding box and save via save_chunk_span.
+    """
+    try:
+        import pdfplumber
+    except Exception:
+        return None
+
+    try:
+        snippet = (chunk_text or '')[:120].strip()
+        if not snippet:
+            return None
+
+        with pdfplumber.open(pdf_path) as doc:
+            for pnum, page in enumerate(doc.pages, start=1):
+                try:
+                    words = page.extract_words(use_text_flow=True)
+                except Exception:
+                    words = []
+                if not words:
+                    # fallback: try page.extract_text()
+                    try:
+                        pg_text = page.extract_text() or ''
+                    except Exception:
+                        pg_text = ''
+                    if snippet in pg_text:
+                        # approximate full-page bbox
+                        w = page.width
+                        h = page.height
+                        save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, 0.0, 0.0, w, h)
+                        return {'page': pnum, 'x': 0.0, 'y': 0.0, 'w': w, 'h': h}
+                    continue
+
+                # Build a list of word texts and their boxes
+                texts = [w.get('text', '') for w in words]
+                joined = ' '.join(texts)
+                idx = joined.find(snippet)
+                if idx == -1:
+                    # try case-insensitive
+                    idx = joined.lower().find(snippet.lower())
+                if idx != -1:
+                    # find word indices roughly covering the match
+                    # We'll search for first and last words matching by matching characters cumulatively
+                    char_count = 0
+                    start_i = None
+                    end_i = None
+                    for i, t in enumerate(texts):
+                        prev = char_count
+                        char_count += len(t) + 1
+                        if start_i is None and prev <= idx < char_count:
+                            start_i = i
+                        if start_i is not None and char_count >= idx + len(snippet):
+                            end_i = i
+                            break
+                    if start_i is None:
+                        start_i = 0
+                    if end_i is None:
+                        end_i = min(len(texts)-1, start_i+5)
+
+                    # aggregate boxes
+                    xs = [float(words[i].get('x0', 0)) for i in range(start_i, end_i+1)]
+                    ys = [float(words[i].get('top', 0)) for i in range(start_i, end_i+1)]
+                    x1s = [float(words[i].get('x1', 0)) for i in range(start_i, end_i+1)]
+                    y1s = [float(words[i].get('bottom', 0)) for i in range(start_i, end_i+1)]
+                    if not xs:
+                        continue
+                    x_min = min(xs)
+                    y_min = min(ys)
+                    x_max = max(x1s)
+                    y_max = max(y1s)
+                    width = max(0.0, x_max - x_min)
+                    height = max(0.0, y_max - y_min)
+                    save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, x_min, y_min, width, height)
+                    return {'page': pnum, 'x': x_min, 'y': y_min, 'w': width, 'h': height}
+
+    except Exception as e:
+        logger.exception('map_chunk_to_bbox failed: %s', e)
+    return None
+
+
+def sanitize_suggested_questions_from_text(txt, max_q=3):
+    """Sanitize raw LLM output and extract up to `max_q` clean question strings.
+    Strategies (in order):
+     - Parse a JSON array if present
+     - Parse JSON objects and pull fields like response/thinking/text/content
+     - Extract explicit question-like lines (lines containing '?')
+     - Regex-extract sentence fragments that end with '?'
+     - Fallback to the first non-empty lines truncated and ensured to end with '?'
+    """
+    import re, json
+
+    def clean_question(s):
+        if not s:
+            return ''
+        s = str(s)
+        # Unescape common escapes
+        s = s.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', ' ').replace('\\"', '"')
+        # Remove stray braces or leading/trailing quotes
+        s = s.strip().strip('"').strip('\'')
+        # Remove leading numbering/bullets
+        s = re.sub(r'^[\s\d\)\.\-•]+', '', s)
+        # Collapse whitespace
+        s = re.sub(r'\s+', ' ', s).strip()
+        if not s:
+            return ''
+        # If there are multiple questions in the same string, keep up to the last '?'
+        if '?' in s:
+            s = s[:s.rfind('?')+1]
+        # Ensure it ends with a question mark
+        if not s.endswith('?'):
+            s = s + '?'
+        return s
+
+    def extract_question_lines(text):
+        lines = [l.strip() for l in re.split(r'[\r\n]+', text) if l.strip()]
+        qs = []
+        for l in lines:
+            if l.endswith('?') or l.startswith('¿') or '?' in l:
+                q = clean_question(l)
+                if q and q not in qs:
+                    qs.append(q)
+                if len(qs) >= max_q:
+                    break
+        # Try sentence-level regex if none found
+        if not qs:
+            matches = re.findall(r'([A-ZÁÉÍÓÚÑ][^\?\.!\n]{10,}?\?)', text)
+            for m in matches:
+                q = clean_question(m)
+                if q and q not in qs:
+                    qs.append(q)
+                if len(qs) >= max_q:
+                    break
+        return qs
+
+    if not txt:
+        return []
+
+    # 1) Try to find a JSON array in the text
+    try:
+        m = re.search(r'(\[\s\S]{0,2000}?\])', txt, re.S)
+        if m:
+            try:
+                arr = json.loads(m.group(1))
+                if isinstance(arr, list):
+                    qs = [clean_question(x) for x in arr if isinstance(x, str)]
+                    qs = [q for q in qs if q]
+                    if qs:
+                        return qs[:max_q]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) Try to find JSON objects and extract common fields
+    try:
+        objs = re.findall(r'(\{[\s\S]{0,2000}?\})', txt)
+        collected = []
+        for o in objs:
+            try:
+                jo = json.loads(o)
+                for k in ('response', 'thinking', 'text', 'content', 'message'):
+                    v = jo.get(k) if isinstance(jo, dict) else None
+                    if isinstance(v, str) and v.strip():
+                        qs = extract_question_lines(v)
+                        for q in qs:
+                            if q not in collected:
+                                collected.append(q)
+                                if len(collected) >= max_q:
+                                    break
+                if len(collected) >= max_q:
+                    break
+            except Exception:
+                continue
+        if collected:
+            return collected[:max_q]
+    except Exception:
+        pass
+
+    # 3) Extract question-like lines directly from the raw text
+    qlines = extract_question_lines(txt)
+    if qlines:
+        return qlines[:max_q]
+
+    # 4) Fallback: regex for fragments ending with '?'
+    try:
+        frag = re.findall(r'([^\r\n]{10,}?\?)', txt)
+        out = []
+        for f in frag:
+            q = clean_question(f)
+            if q and q not in out:
+                out.append(q)
+            if len(out) >= max_q:
+                break
+        if out:
+            return out[:max_q]
+    except Exception:
+        pass
+
+    # 5) Last resort: use first non-empty lines and ensure they are short and end with '?'
+    lines = [l.strip() for l in re.split(r'[\r\n]+', txt) if l.strip()]
+    out = []
+    for l in lines:
+        q = clean_question(l)
+        if q:
+            out.append(q)
+        if len(out) >= max_q:
+            break
+    return out[:max_q]
+
 def get_pdf_embedding_type(pdf_id):
     with conn.cursor() as cur:
         cur.execute("SELECT embedding_type FROM pdfs WHERE id = %s", (pdf_id,))
@@ -619,17 +858,57 @@ def get_pdf_embedding_type(pdf_id):
         return result[0] if result else None
 
 def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
+    """Return both chunks and metadata for provenance/evidence tracking.
+    Returns: (chunks_list, sources_list) where sources contain id, chunk text, page hints.
+    """
     table_name = "pdf_chunks_ollama" if embedding_type == "ollama" else "pdf_chunks_openai"
     with conn.cursor() as cur:
         # Convertir la lista de Python a string de vector de PostgreSQL
         vector_str = '[' + ','.join(map(str, query_embedding)) + ']'
         cur.execute(f"""
-            SELECT chunk FROM {table_name}
+            SELECT id, chunk FROM {table_name}
             WHERE pdf_id = %s
             ORDER BY embedding <-> %s::vector
             LIMIT %s
         """, (pdf_id, vector_str, top_k))
-        return [row[0] for row in cur.fetchall()]
+        results = cur.fetchall()
+    
+    chunks = []
+    sources = []
+    for chunk_id, chunk_text in results:
+        chunks.append(chunk_text)
+        # Try to infer page number from chunk text (look for "Página N" markers)
+        import re
+        page_match = re.search(r'P[áa]gina\s+(\d+)', chunk_text or '', re.IGNORECASE)
+        page_num = int(page_match.group(1)) if page_match else None
+        
+        # Extract first 200 chars as preview
+        preview = (chunk_text or '')[:200].strip()
+        if len(chunk_text or '') > 200:
+            preview += '...'
+        
+        # Try to fetch stored span (bounding box) if available
+        span = None
+        try:
+            with conn.cursor() as cur2:
+                cur2.execute("SELECT page_number, x, y, width, height FROM pdf_chunk_spans WHERE chunk_id = %s AND pdf_id = %s ORDER BY id LIMIT 1", (chunk_id, pdf_id))
+                rspan = cur2.fetchone()
+                if rspan:
+                    span = {'page': rspan[0], 'x': float(rspan[1]), 'y': float(rspan[2]), 'w': float(rspan[3]), 'h': float(rspan[4])}
+        except Exception:
+            span = None
+
+        src = {
+            'chunk_id': chunk_id,
+            'page': page_num,
+            'preview': preview,
+            'pdf_id': pdf_id
+        }
+        if span:
+            src['coords'] = span
+        sources.append(src)
+    
+    return chunks, sources
 
 @app.post("/upload_pdf/")
 async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...), file_hash: str = Form(None)):
@@ -796,7 +1075,16 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
             embedding = get_openai_embedding(chunk, openai_api_key)
         else:
             raise Exception("Tipo de embedding no soportado")
-        save_embedding(pdf_id, chunk, embedding, embedding_type)
+        try:
+            inserted_chunk_id = save_embedding(pdf_id, chunk, embedding, embedding_type)
+        except Exception:
+            inserted_chunk_id = None
+        try:
+            pdf_path = str(Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf")
+            if inserted_chunk_id and os.path.exists(pdf_path):
+                map_chunk_to_bbox(pdf_path, chunk, inserted_chunk_id, 'pdf_chunks_ollama' if embedding_type=='ollama' else 'pdf_chunks_openai', pdf_id)
+        except Exception:
+            pass
 
     return {"filename": pdf.filename, "embedding_type": embedding_type, "pdf_id": pdf_id}
 
@@ -968,7 +1256,19 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
                     embedding = get_openai_embedding(chunk, openai_api_key)
                 else:
                     raise Exception("Tipo de embedding no soportado")
-                save_embedding(pdf_id, chunk, embedding, embedding_type)
+                # Save embedding and get the inserted chunk id
+                try:
+                    inserted_chunk_id = save_embedding(pdf_id, chunk, embedding, embedding_type)
+                except Exception:
+                    inserted_chunk_id = None
+
+                # Try to map the chunk to a bbox in the saved PDF (best-effort)
+                try:
+                    pdf_path = str(Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf")
+                    if inserted_chunk_id and os.path.exists(pdf_path):
+                        map_chunk_to_bbox(pdf_path, chunk, inserted_chunk_id, 'pdf_chunks_ollama' if embedding_type=='ollama' else 'pdf_chunks_openai', pdf_id)
+                except Exception:
+                    pass
 
             results.append({'filename': pdf.filename, 'status': 'uploaded', 'pdf_id': pdf_id})
         except HTTPException as he:
@@ -980,7 +1280,7 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
 
 
 @app.post("/chat/")
-async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama")):
+async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0')):
     # Verificar que el tipo de embedding coincida con el del PDF
     pdf_embedding_type = get_pdf_embedding_type(pdf_id)
     if pdf_embedding_type and pdf_embedding_type != embedding_type:
@@ -998,7 +1298,7 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
     else:
         raise Exception("Tipo de embedding no soportado")
     try:
-        chunks = search_similar_chunks(pdf_id, query_embedding, embedding_type)
+        chunks, sources = search_similar_chunks(pdf_id, query_embedding, embedding_type)
     except Exception as e:
         logger.exception("Error searching similar chunks for pdf_id=%s", pdf_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving context for PDF: {e}")
@@ -1221,7 +1521,79 @@ Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualq
     # Final metadata: images_analyzed are the pages we actually attached
     images_analyzed = images_added
 
-    return {"response": answer, "used_vlm_enhanced": bool(used_vlm_enhanced and len(images_analyzed) > 0), "images_analyzed": images_analyzed}
+    suggested_questions = []
+    # Only generate suggestions when explicitly requested (frontend will ask only for first assistant response)
+    do_suggest = str(include_suggestions).lower() in ('1', 'true', 'yes', 'y')
+    if do_suggest:
+        try:
+            followup_prompt = (
+                f"Genera tres preguntas de seguimiento concisas en español basadas en la siguiente respuesta y la pregunta original."
+                f" Devuelve únicamente una lista clara de preguntas (una por línea o un JSON array).\n\nRespuesta: {answer}\nPregunta original: {query}\n\nEjemplo output (JSON): [\"Pregunta 1\", \"Pregunta 2\", \"Pregunta 3\"]"
+            )
+
+            txt = ''
+            # Choose provider order based on how the PDF was uploaded to avoid unnecessary fallbacks
+            try:
+                provider_pref = []
+                if pdf_embedding_type and str(pdf_embedding_type).lower() == 'openai':
+                    provider_pref = ['openai', 'ollama']
+                else:
+                    provider_pref = ['ollama', 'openai']
+            except Exception:
+                provider_pref = ['ollama', 'openai']
+
+            for provider in provider_pref:
+                if provider == 'ollama':
+                    try:
+                        logger.info('chat(): trying Ollama for follow-up suggestions (pdf_id=%s)', pdf_id)
+                        ollama_res = requests.post("http://localhost:11434/api/generate", json={"model": "qwen3:4b", "prompt": followup_prompt}, timeout=8)
+                        if ollama_res.ok:
+                            try:
+                                jr = ollama_res.json()
+                                txt = jr.get('response') or jr.get('text') or ''
+                            except Exception:
+                                txt = ollama_res.text
+                    except Exception as e:
+                        logger.warning('chat(): Ollama follow-up failed: %s', e)
+                else:
+                    # openai
+                    if not openai_api_key:
+                        continue
+                    try:
+                        logger.info('chat(): trying OpenAI for follow-up suggestions (pdf_id=%s)', pdf_id)
+                        url2 = "https://api.openai.com/v1/chat/completions"
+                        headers2 = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
+                        payload2 = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": followup_prompt}], "max_tokens": 150}
+                        r2 = requests.post(url2, headers=headers2, json=payload2, timeout=10)
+                        if r2.ok:
+                            txt = r2.json().get('choices', [{}])[0].get('message', {}).get('content', '')
+                    except Exception as e:
+                        logger.warning('chat(): OpenAI follow-up failed: %s', e)
+
+                if txt:
+                    logger.info('chat(): follow-up suggestions generated by %s for pdf_id=%s', provider, pdf_id)
+                    break
+
+            # Parse & sanitize model output to produce up to 3 clean questions
+            try:
+                suggested_questions = sanitize_suggested_questions_from_text(txt, max_q=3)
+            except Exception:
+                suggested_questions = []
+        except Exception:
+            # Outer try guard: on any unexpected failure, return no suggestions
+            suggested_questions = []
+    # Ensure it's a list of max 3 strings
+    if not isinstance(suggested_questions, list):
+        suggested_questions = []
+    suggested_questions = [str(s).strip() for s in suggested_questions if str(s).strip()][:3]
+
+    return {
+        "response": answer,
+        "used_vlm_enhanced": bool(used_vlm_enhanced and len(images_analyzed) > 0),
+        "images_analyzed": images_analyzed,
+        "sources": sources,  # Evidence/provenance for frontend
+        "suggested_questions": suggested_questions
+    }
 
 
 @app.get('/pdfs/{pdf_id}/debug')
@@ -1272,6 +1644,98 @@ async def pdf_debug(pdf_id: int):
         'chunks_ollama_sample': chunks_ollama[:3],
         'chunks_openai_sample': chunks_openai[:3]
     }
+
+
+
+@app.get('/pdfs/{pdf_id}/suggest_questions')
+async def suggest_questions(pdf_id: int):
+    """Generate up to 3 suggested starter questions for a PDF using available models.
+    This endpoint is intended to be called when a user opens/selects a document so the UI
+    can show starter suggestions immediately.
+    """
+    # Build a compact context from stored captions and OCR snippets
+    with conn.cursor() as cur:
+        cur.execute("SELECT caption, page_number FROM pdf_images WHERE pdf_id = %s ORDER BY page_number", (pdf_id,))
+        imgs = cur.fetchall()
+        # assemble short image summaries
+        image_summaries = []
+        for cap, pnum in imgs:
+            if cap and cap.strip():
+                image_summaries.append(f"Página {pnum}: {str(cap)[:200]}")
+
+        # fetch some representative chunks to form context
+        chunks = []
+        try:
+            cur.execute("SELECT chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id LIMIT 6", (pdf_id,))
+            chunks += [r[0] for r in cur.fetchall()]
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id LIMIT 6", (pdf_id,))
+            chunks += [r[0] for r in cur.fetchall()]
+        except Exception:
+            pass
+
+    context = ''
+    if image_summaries:
+        context += '[IMAGE_SUMMARIES]\n' + '\n'.join(image_summaries) + '\n\n'
+    context += '\n'.join([c for c in chunks if c])
+
+    followup_prompt = (
+        f"Genera tres preguntas de seguimiento concisas en español basadas en el siguiente extracto del documento."
+        f" Devuelve únicamente una lista clara de preguntas (una por línea o un JSON array).\n\nExtracto:\n{context}\n\nEjemplo output (JSON): [\"Pregunta 1\", \"Pregunta 2\", \"Pregunta 3\"]"
+    )
+
+    txt = ''
+    # Choose provider order based on how the PDF was uploaded
+    openai_api_key = os.getenv('OPENAI_API_KEY', '')
+    try:
+        pdf_embed = get_pdf_embedding_type(pdf_id)
+    except Exception:
+        pdf_embed = None
+
+    provider_pref = ['ollama', 'openai']
+    if pdf_embed and str(pdf_embed).lower() == 'openai':
+        provider_pref = ['openai', 'ollama']
+
+    for provider in provider_pref:
+        if provider == 'ollama':
+            try:
+                logger.info('suggest_questions: trying Ollama for pdf_id=%s', pdf_id)
+                resp = requests.post('http://localhost:11434/api/generate', json={'model': 'qwen3:4b', 'prompt': followup_prompt}, timeout=8)
+                if resp.ok:
+                    try:
+                        jr = resp.json()
+                        txt = jr.get('response') or jr.get('text') or ''
+                    except Exception:
+                        txt = resp.text
+            except Exception as e:
+                logger.warning('suggest_questions: Ollama call failed: %s', e)
+        else:
+            if not openai_api_key:
+                continue
+            try:
+                logger.info('suggest_questions: trying OpenAI for pdf_id=%s', pdf_id)
+                url = 'https://api.openai.com/v1/chat/completions'
+                headers = {'Authorization': f'Bearer {openai_api_key}', 'Content-Type': 'application/json'}
+                payload = { 'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': followup_prompt}], 'max_tokens': 150 }
+                r2 = requests.post(url, headers=headers, json=payload, timeout=8)
+                if r2.ok:
+                    txt = r2.json().get('choices', [{}])[0].get('message', {}).get('content', '')
+            except Exception as e:
+                logger.warning('suggest_questions: OpenAI call failed: %s', e)
+
+        if txt:
+            logger.info('suggest_questions: generated suggestions with %s for pdf_id=%s', provider, pdf_id)
+            break
+
+    # Parse & sanitize model output to ensure up to 3 clean questions
+    try:
+        suggested_questions = sanitize_suggested_questions_from_text(txt, max_q=3)
+    except Exception:
+        suggested_questions = []
+
+    return {'suggested_questions': suggested_questions}
 
 
 # --- Metadata endpoints for frontend sync (folders, favorites, tags) ---
@@ -1584,9 +2048,64 @@ async def get_pdf_info(pdf_id: int):
                 images.append({'path': str(p), 'page': num})
 
         return {'pdf_id': pdf_id, 'pages': pages, 'images': images}
+
     except Exception as e:
         logger.exception('Failed to get pdf info for id=%s: %s', pdf_id, e)
         raise HTTPException(status_code=500, detail='Internal server error')
+
+
+@app.post('/admin/reprocess_spans')
+async def admin_reprocess_spans(pdf_id: int = None):
+    """Reprocess existing PDFs to map stored chunks to bounding boxes (best-effort).
+    If pdf_id is provided, process only that PDF; otherwise process all PDFs.
+    This can be slow for many PDFs. Requires pdfplumber to be installed.
+    """
+    processed = []
+    failed = []
+    with conn.cursor() as cur:
+        if pdf_id:
+            cur.execute("SELECT id FROM pdfs WHERE id = %s", (pdf_id,))
+            rows = cur.fetchall()
+        else:
+            cur.execute("SELECT id FROM pdfs")
+            rows = cur.fetchall()
+
+    for (pid,) in rows:
+        try:
+            pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pid}.pdf"
+            if not pdf_path.exists():
+                failed.append({'pdf_id': pid, 'error': 'pdf file missing'})
+                continue
+
+            # Fetch chunks from both tables
+            all_chunks = []
+            with conn.cursor() as cur2:
+                try:
+                    cur2.execute("SELECT id, chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (pid,))
+                    all_chunks += [('pdf_chunks_openai', r[0], r[1]) for r in cur2.fetchall()]
+                except Exception:
+                    pass
+                try:
+                    cur2.execute("SELECT id, chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (pid,))
+                    all_chunks += [('pdf_chunks_ollama', r[0], r[1]) for r in cur2.fetchall()]
+                except Exception:
+                    pass
+
+            for table_name, chunk_id, chunk_text in all_chunks:
+                try:
+                    # Skip if spans already exist for this chunk
+                    with conn.cursor() as cur3:
+                        cur3.execute("SELECT 1 FROM pdf_chunk_spans WHERE chunk_id = %s AND pdf_id = %s LIMIT 1", (chunk_id, pid))
+                        if cur3.fetchone():
+                            continue
+                    map_chunk_to_bbox(str(pdf_path), chunk_text, chunk_id, table_name, pid)
+                except Exception as e:
+                    logger.exception('Failed mapping chunk %s of pdf %s: %s', chunk_id, pid, e)
+            processed.append(pid)
+        except Exception as e:
+            failed.append({'pdf_id': pid, 'error': str(e)})
+
+    return {'processed': processed, 'failed': failed}
 
 
 @app.get('/folders/')
