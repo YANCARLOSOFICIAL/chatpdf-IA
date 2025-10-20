@@ -4,6 +4,7 @@
       <div class="upload-icon">📄</div>
       <h2>Sube tu documento PDF</h2>
       <p>Arrastra y suelta un archivo o haz clic para seleccionar</p>
+      <p class="system-info">El sistema usará el modelo configurado por el administrador</p>
       
       <div class="upload-controls">
         <label class="file-input-wrapper">
@@ -17,15 +18,6 @@
             {{ selectedFileName || '📁 Seleccionar PDF' }}
           </span>
         </label>
-
-        <select 
-          v-model="localEmbeddingType" 
-          class="select-embedding"
-          @change="$emit('update:embeddingType', localEmbeddingType)"
-        >
-          <option value="openai">OpenAI Embeddings</option>
-          <option value="ollama">Ollama Embeddings</option>
-        </select>
 
         <button 
           class="btn-submit"
@@ -50,10 +42,6 @@ export default {
     ProgressBar
   },
   props: {
-    embeddingType: {
-      type: String,
-      default: 'openai'
-    },
     isUploading: {
       type: Boolean,
       default: false
@@ -63,21 +51,15 @@ export default {
       default: 0
     }
   },
-  emits: ['upload', 'update:embeddingType'],
+  emits: ['upload'],
   data() {
     return {
-      selectedFile: null,
-      localEmbeddingType: this.embeddingType
+      selectedFile: null
     };
   },
   computed: {
     selectedFileName() {
       return this.selectedFile ? this.selectedFile.name : '';
-    }
-  },
-  watch: {
-    embeddingType(newVal) {
-      this.localEmbeddingType = newVal;
     }
   },
   methods: {
@@ -93,8 +75,7 @@ export default {
     handleUpload() {
       if (this.selectedFile) {
         this.$emit('upload', {
-          file: this.selectedFile,
-          embeddingType: this.localEmbeddingType
+          file: this.selectedFile
         });
         this.selectedFile = null;
         if (this.$refs.fileInput) {
@@ -149,6 +130,13 @@ export default {
   margin-bottom: 32px;
 }
 
+.system-info {
+  font-size: 13px;
+  color: #60a5fa;
+  margin-bottom: 16px;
+  font-style: italic;
+}
+
 .upload-controls {
   display: flex;
   flex-direction: column;
@@ -185,23 +173,6 @@ export default {
 .file-input-wrapper:hover .btn-upload {
   border-color: #4d6cfa;
   color: #e4e6eb;
-}
-
-.select-embedding {
-  padding: 14px 16px;
-  background: #1e2640;
-  border: 1px solid #2a3152;
-  border-radius: 8px;
-  color: #e4e6eb;
-  font-size: 15px;
-  font-family: inherit;
-  cursor: pointer;
-  outline: none;
-  transition: all 0.2s;
-}
-
-.select-embedding:focus {
-  border-color: #4d6cfa;
 }
 
 .btn-submit {
@@ -243,16 +214,14 @@ export default {
   color: #718096;
 }
 
+:global(#app.light-mode) .system-info {
+  color: #3b82f6;
+}
+
 :global(#app.light-mode) .btn-upload {
   background: #f7fafc;
   border-color: #e2e8f0;
   color: #718096;
-}
-
-:global(#app.light-mode) .select-embedding {
-  background: #f7fafc;
-  border-color: #e2e8f0;
-  color: #1a202c;
 }
 
 @media (max-width: 768px) {

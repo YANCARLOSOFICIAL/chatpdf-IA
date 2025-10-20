@@ -48,17 +48,35 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Configure CORS. Prefer an explicit FRONTEND_ORIGIN in env for dev or prod usage.
+# If FRONTEND_ORIGIN is not set, fall back to localhost:5173 (Vite dev server).
+FRONTEND_ORIGIN = os.getenv('FRONTEND_ORIGIN', 'http://localhost:5173')
+allow_origins = [o.strip() for o in FRONTEND_ORIGIN.split(',')] if FRONTEND_ORIGIN else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Authorization", "Content-Disposition"],
 )
 
 # Configuración de la base de datos
-PG_CONN = os.getenv("PG_CONN", "dbname=chatpdf user=postgres password=postgres host=localhost")
-conn = psycopg2.connect(PG_CONN)
+# Try to parse PG_CONN or use individual parameters to avoid encoding issues
+PG_CONN = os.getenv("PG_CONN", "")
+if PG_CONN and not any(ord(c) > 127 for c in PG_CONN):
+    # Safe ASCII connection string
+    conn = psycopg2.connect(PG_CONN)
+else:
+    # Use individual parameters to avoid encoding issues
+    conn = psycopg2.connect(
+        dbname=os.getenv("PG_DATABASE", "chatpdf"),
+        user=os.getenv("PG_USER", "postgres"),
+        password=os.getenv("PG_PASSWORD", "postgres"),
+        host=os.getenv("PG_HOST", "localhost"),
+        port=os.getenv("PG_PORT", "5432")
+    )
 register_vector(conn)
 
 # Ensure folders table and folder_id column exist
@@ -131,9 +149,80 @@ def init_db_schema():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        # Users and roles for basic RBAC
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS roles (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, role_id)
+            )
+        ''')
+        # System configuration table for global settings (default models, etc)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS system_config (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        conn.commit()
+        
+        # Insert default system configuration
+        cur.execute('''
+            INSERT INTO system_config (key, value) VALUES 
+            ('default_embedding_type', 'openai'),
+            ('default_ollama_model', 'qwen3-embedding:0.6b'),
+            ('default_openai_model', 'text-embedding-3-large')
+            ON CONFLICT (key) DO NOTHING
+        ''')
         conn.commit()
 
 init_db_schema()
+
+# Ensure a default admin user and role exist (use env vars to override)
+try:
+    DEFAULT_ADMIN_USERNAME = os.getenv('DEFAULT_ADMIN_USERNAME', 'admin')
+    DEFAULT_ADMIN_PASSWORD = os.getenv('DEFAULT_ADMIN_PASSWORD', 'adminpass')
+    if DEFAULT_ADMIN_USERNAME and DEFAULT_ADMIN_PASSWORD:
+        with conn.cursor() as cur:
+            # ensure admin role
+            cur.execute("INSERT INTO roles (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", ('admin',))
+            conn.commit()
+            cur.execute("SELECT id FROM roles WHERE name = %s", ('admin',))
+            rid = cur.fetchone()[0]
+
+            # ensure user
+            cur.execute("SELECT id FROM users WHERE username = %s", (DEFAULT_ADMIN_USERNAME,))
+            ur = cur.fetchone()
+            if not ur:
+                ph = create_password_hash(DEFAULT_ADMIN_PASSWORD)
+                cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING id", (DEFAULT_ADMIN_USERNAME, ph))
+                uid = cur.fetchone()[0]
+                conn.commit()
+                cur.execute("INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (uid, rid))
+                conn.commit()
+                logger.info('Default admin user created: %s', DEFAULT_ADMIN_USERNAME)
+            else:
+                uid = ur[0]
+                cur.execute("INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (uid, rid))
+                conn.commit()
+                logger.info('Default admin user ensured and role assigned: %s', DEFAULT_ADMIN_USERNAME)
+except Exception as e:
+    logger.exception('Failed to ensure default admin user: %s', e)
 
 # DB metadata helpers
 def get_pdf_metadata_from_db(pdf_id):
@@ -170,6 +259,123 @@ def upsert_pdf_metadata_db(pdf_id, meta):
         conn.commit()
 
 from datetime import datetime
+from fastapi import Depends
+import jwt
+from passlib.context import CryptContext
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# JWT / auth setup
+JWT_SECRET = os.getenv('JWT_SECRET', 'dev-secret-change-me')
+JWT_ALGO = 'HS256'
+ACCESS_TOKEN_EXPIRE_SECONDS = int(os.getenv('ACCESS_TOKEN_EXPIRE_SECONDS', '3600'))
+
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def create_password_hash(password: str) -> str:
+    # bcrypt (used by pwd_ctx) has a 72-byte input limit and some platforms
+    # expose backend import issues. To avoid runtime exceptions during user
+    # registration, prefer a safer fallback:
+    try:
+        # If password bytes exceed bcrypt limit, skip trying bcrypt and
+        # use pbkdf2_sha256 which supports arbitrary lengths.
+        pw_bytes = password.encode('utf-8') if isinstance(password, str) else bytes(password)
+        if len(pw_bytes) > 72:
+            from passlib.hash import pbkdf2_sha256
+            logger.info('create_password_hash: password >72 bytes, using pbkdf2_sha256')
+            return pbkdf2_sha256.hash(password)
+
+        # Try the primary (bcrypt) via passlib context
+        return pwd_ctx.hash(password)
+    except Exception as e:
+        # Log and fallback to pbkdf2_sha256 for maximum compatibility
+        logger.warning('create_password_hash: pwd_ctx.hash failed (%s). Falling back to pbkdf2_sha256.', e)
+        try:
+            from passlib.hash import pbkdf2_sha256
+            return pbkdf2_sha256.hash(password)
+        except Exception as e2:
+            logger.exception('create_password_hash: pbkdf2_sha256 fallback also failed: %s', e2)
+            # Re-raise the original exception to fail fast if both methods fail
+            raise
+
+def verify_password(password: str, hash: str) -> bool:
+    # Primary path: let passlib handle verification (supports bcrypt)
+    try:
+        return pwd_ctx.verify(password, hash)
+    except Exception as e:
+        # Log the failure and try fallbacks. On some Windows installs the
+        # underlying 'bcrypt' package may be present but not expose the
+        # metadata passlib expects, causing an AttributeError during probing.
+        logger.warning('pwd_ctx.verify raised exception: %s. Trying fallbacks.', e)
+
+    # Fallback 1: try the bcrypt package directly if available
+    try:
+        import bcrypt as _bcrypt
+        try:
+            h = hash.encode('utf-8') if isinstance(hash, str) else hash
+            pw = password.encode('utf-8')
+            ok = _bcrypt.checkpw(pw, h)
+            logger.info('verify_password: bcrypt.checkpw fallback used, result=%s', ok)
+            return bool(ok)
+        except Exception as e2:
+            logger.warning('bcrypt.checkpw fallback failed: %s', e2)
+    except Exception:
+        # bcrypt not installed or failed to import
+        pass
+
+    # Fallback 2: try common passlib alternative (pbkdf2_sha256) in case
+    # the stored hash uses a different scheme.
+    try:
+        from passlib.hash import pbkdf2_sha256
+        try:
+            ok2 = pbkdf2_sha256.verify(password, hash)
+            logger.info('verify_password: pbkdf2_sha256 fallback used, result=%s', ok2)
+            return bool(ok2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # If all methods fail, return False
+    return False
+
+def create_access_token(payload: dict, expire_in: int = ACCESS_TOKEN_EXPIRE_SECONDS) -> str:
+    data = payload.copy()
+    data['exp'] = datetime.utcnow().timestamp() + expire_in
+    token = jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGO)
+    return token
+
+def decode_access_token(token: str) -> dict:
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return data
+    except Exception:
+        return {}
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    token = creds.credentials
+    data = decode_access_token(token)
+    user_id = data.get('user_id')
+    if not user_id:
+        raise HTTPException(status_code=401, detail='Invalid token')
+    with conn.cursor() as cur:
+        cur.execute('SELECT id, username FROM users WHERE id = %s', (user_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=401, detail='User not found')
+        return {'id': r[0], 'username': r[1]}
+
+def require_role(role_name: str):
+    def _dep(user = Depends(get_current_user)):
+        uid = user.get('id')
+        with conn.cursor() as cur:
+            cur.execute('SELECT r.name FROM roles r JOIN user_roles ur ON r.id = ur.role_id WHERE ur.user_id = %s', (uid,))
+            rows = [r[0] for r in cur.fetchall()]
+            if role_name not in rows:
+                raise HTTPException(status_code=403, detail='Insufficient role')
+            return user
+    return _dep
+
 
 # Path to write a simple migration result summary (used by status endpoint)
 MIGRATION_RESULT_PATH = Path(__file__).resolve().parent / 'migration_result.json'
@@ -915,7 +1121,26 @@ def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
     return chunks, sources
 
 @app.post("/upload_pdf/")
-async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...), file_hash: str = Form(None)):
+async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(None), file_hash: str = Form(None)):
+    # If no embedding_type provided, use system default
+    if not embedding_type or embedding_type.strip() == '':
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'default_embedding_type'")
+                row = cur.fetchone()
+                embedding_type = row[0] if row and row[0] else 'openai'
+                logger.info(f"Using embedding_type from config: {embedding_type}")
+        except Exception as e:
+            logger.warning(f"Could not read system_config, defaulting to 'openai': {e}")
+            embedding_type = 'openai'
+    
+    # Validate embedding_type
+    if embedding_type not in ['openai', 'ollama']:
+        logger.error(f"Invalid embedding_type received: '{embedding_type}'")
+        embedding_type = 'openai'
+    
+    logger.info(f"Final embedding_type for upload: {embedding_type}")
+    
     # Read bytes and compute hash if not provided
     file_bytes = await pdf.read()
     computed_hash = hashlib.sha256(file_bytes).hexdigest()
@@ -1070,13 +1295,30 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
     # Dividir texto en chunks simples
     chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
 
+    # Get specific model from config if using ollama
+    ollama_model = "embeddinggemma:latest"
+    openai_model = "text-embedding-3-large"
+    
+    if embedding_type == "ollama":
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_ollama_model'")
+            row = cur.fetchone()
+            if row and row[0]:
+                ollama_model = row[0]
+    elif embedding_type == "openai":
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_openai_model'")
+            row = cur.fetchone()
+            if row and row[0]:
+                openai_model = row[0]
+
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     for chunk in chunks:
         print("Chunk type:", type(chunk), "Chunk length:", len(chunk))
         if embedding_type == "ollama":
-            embedding = get_ollama_embedding(chunk)
+            embedding = get_ollama_embedding(chunk, model=ollama_model)
         elif embedding_type == "openai":
-            embedding = get_openai_embedding(chunk, openai_api_key)
+            embedding = get_openai_embedding(chunk, openai_api_key, model=openai_model)
         else:
             raise Exception("Tipo de embedding no soportado")
         try:
@@ -1094,10 +1336,29 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(...
 
 
 @app.post('/upload_pdfs/')
-async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = Form(...), file_hashes: list[str] | None = Form(None)):
+async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = Form(None), file_hashes: list[str] | None = Form(None)):
     """Accept multiple PDF uploads in one request. Returns per-file results.
     Expect multiple 'pdf' files and optionally multiple 'file_hashes' values in the same order.
     """
+    # If no embedding_type provided, use system default
+    if not embedding_type or embedding_type.strip() == '':
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'default_embedding_type'")
+                row = cur.fetchone()
+                embedding_type = row[0] if row and row[0] else 'openai'
+                logger.info(f"Using embedding_type from config (batch): {embedding_type}")
+        except Exception as e:
+            logger.warning(f"Could not read system_config (batch), defaulting to 'openai': {e}")
+            embedding_type = 'openai'
+    
+    # Validate embedding_type
+    if embedding_type not in ['openai', 'ollama']:
+        logger.error(f"Invalid embedding_type received (batch): '{embedding_type}'")
+        embedding_type = 'openai'
+    
+    logger.info(f"Final embedding_type for batch upload: {embedding_type}")
+    
     results = []
     # Normalize file_hashes
     if file_hashes is None:
@@ -2125,6 +2386,300 @@ async def admin_reprocess_spans(pdf_id: int = None):
             failed.append({'pdf_id': pid, 'error': str(e)})
 
     return {'processed': processed, 'failed': failed}
+
+
+@app.post('/auth/register')
+async def auth_register(username: str = Form(...), password: str = Form(...)):
+    if not username or not password:
+        raise HTTPException(status_code=400, detail='username and password required')
+    pwd_hash = create_password_hash(password)
+    try:
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO users (username, password_hash) VALUES (%s,%s) RETURNING id', (username, pwd_hash))
+            uid = cur.fetchone()[0]
+            conn.commit()
+    except Exception as e:
+        logger.exception('auth_register failed: %s', e)
+        raise HTTPException(status_code=400, detail='User creation failed (maybe username exists)')
+    token = create_access_token({'user_id': uid})
+    return {'user': {'id': uid, 'username': username}, 'token': token}
+
+
+@app.post('/auth/login')
+async def auth_login(username: str = Form(...), password: str = Form(...)):
+    with conn.cursor() as cur:
+        cur.execute('SELECT id, password_hash FROM users WHERE username = %s', (username,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+        uid, ph = r[0], r[1]
+        if not verify_password(password, ph):
+            raise HTTPException(status_code=401, detail='Invalid credentials')
+    token = create_access_token({'user_id': uid})
+    return {'user': {'id': uid, 'username': username}, 'token': token}
+
+
+@app.get('/auth/me')
+async def auth_me(user = Depends(get_current_user)):
+    # Include the list of role names assigned to the current user
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT r.name FROM roles r JOIN user_roles ur ON r.id = ur.role_id WHERE ur.user_id = %s', (user.get('id'),))
+            rows = cur.fetchall()
+            roles = [r[0] for r in rows]
+    except Exception:
+        roles = []
+    return {'user': user, 'roles': roles}
+
+
+@app.post('/roles')
+async def create_role(name: str = Form(...), _admin=Depends(require_role('admin'))):
+    try:
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO roles (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id', (name,))
+            r = cur.fetchone()
+            conn.commit()
+            if r:
+                return {'id': r[0], 'name': name}
+            # already exists
+            cur.execute('SELECT id FROM roles WHERE name = %s', (name,))
+            eid = cur.fetchone()[0]
+            return {'id': eid, 'name': name}
+    except Exception as e:
+        logger.exception('create_role failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to create role')
+
+
+@app.post('/roles/assign')
+async def assign_role(username: str = Form(...), role: str = Form(...), _admin=Depends(require_role('admin'))):
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM users WHERE username = %s', (username,))
+            ur = cur.fetchone()
+            if not ur:
+                raise HTTPException(status_code=404, detail='User not found')
+            uid = ur[0]
+            cur.execute('SELECT id FROM roles WHERE name = %s', (role,))
+            rr = cur.fetchone()
+            if not rr:
+                raise HTTPException(status_code=404, detail='Role not found')
+            rid = rr[0]
+            cur.execute('INSERT INTO user_roles (user_id, role_id) VALUES (%s,%s) ON CONFLICT DO NOTHING', (uid, rid))
+            conn.commit()
+            return {'ok': True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('assign_role failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to assign role')
+
+
+@app.post('/roles/unassign')
+async def unassign_role(username: str = Form(...), role: str = Form(...), _admin=Depends(require_role('admin'))):
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM users WHERE username = %s', (username,))
+            ur = cur.fetchone()
+            if not ur:
+                raise HTTPException(status_code=404, detail='User not found')
+            uid = ur[0]
+            cur.execute('SELECT id FROM roles WHERE name = %s', (role,))
+            rr = cur.fetchone()
+            if not rr:
+                raise HTTPException(status_code=404, detail='Role not found')
+            rid = rr[0]
+            cur.execute('DELETE FROM user_roles WHERE user_id = %s AND role_id = %s', (uid, rid))
+            conn.commit()
+            return {'ok': True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('unassign_role failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to unassign role')
+
+
+@app.get('/admin/users')
+async def list_users(_admin=Depends(require_role('admin'))):
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT u.id, u.username, array_agg(r.name) as roles FROM users u LEFT JOIN user_roles ur ON u.id = ur.user_id LEFT JOIN roles r ON ur.role_id = r.id GROUP BY u.id, u.username ORDER BY u.id')
+            rows = cur.fetchall()
+        users = []
+        for r in rows:
+            uid = r[0]
+            uname = r[1]
+            rnames = r[2] or []
+            # normalize array_agg result which may be returned as list or string
+            if isinstance(rnames, str):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(rnames)
+                    rnames = parsed if isinstance(parsed, (list, tuple)) else [rnames]
+                except Exception:
+                    rnames = [rnames]
+            users.append({'id': uid, 'username': uname, 'roles': [x for x in (rnames or []) if x]})
+        return {'users': users}
+    except Exception as e:
+        logger.exception('list_users failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to list users')
+
+
+@app.get('/roles')
+async def list_roles(user = Depends(get_current_user)):
+    with conn.cursor() as cur:
+        cur.execute('SELECT id, name FROM roles ORDER BY id')
+        rows = cur.fetchall()
+    return {'roles': [{'id': r[0], 'name': r[1]} for r in rows]}
+
+
+# ============================================================
+# ADMIN ENDPOINTS: USER CRUD
+# ============================================================
+
+@app.post('/admin/users')
+async def create_user(username: str = Form(...), password: str = Form(...), roles: str = Form(''), _admin=Depends(require_role('admin'))):
+    """Create a new user with optional role assignments (comma-separated role names)"""
+    try:
+        with conn.cursor() as cur:
+            # Check if user already exists
+            cur.execute('SELECT id FROM users WHERE username = %s', (username,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail='Username already exists')
+            
+            # Create user
+            password_hash = create_password_hash(password)
+            cur.execute('INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING id', (username, password_hash))
+            user_id = cur.fetchone()[0]
+            conn.commit()
+            
+            # Assign roles if provided
+            if roles:
+                role_list = [r.strip() for r in roles.split(',') if r.strip()]
+                for role_name in role_list:
+                    cur.execute('SELECT id FROM roles WHERE name = %s', (role_name,))
+                    role_row = cur.fetchone()
+                    if role_row:
+                        cur.execute('INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING', (user_id, role_row[0]))
+                conn.commit()
+            
+            logger.info(f'Admin created user: {username} with roles: {roles}')
+            return {'ok': True, 'user_id': user_id, 'username': username}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('create_user failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to create user')
+
+
+@app.put('/admin/users/{user_id}/password')
+async def update_user_password(user_id: int, new_password: str = Form(...), _admin=Depends(require_role('admin'))):
+    """Change a user's password"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id, username FROM users WHERE id = %s', (user_id,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found')
+            
+            password_hash = create_password_hash(new_password)
+            cur.execute('UPDATE users SET password_hash = %s WHERE id = %s', (password_hash, user_id))
+            conn.commit()
+            
+            logger.info(f'Admin changed password for user: {user[1]}')
+            return {'ok': True, 'username': user[1]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('update_user_password failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to update password')
+
+
+@app.delete('/admin/users/{user_id}')
+async def delete_user(user_id: int, _admin=Depends(require_role('admin'))):
+    """Delete a user (cascades to user_roles)"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT username FROM users WHERE id = %s', (user_id,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found')
+            
+            cur.execute('DELETE FROM users WHERE id = %s', (user_id,))
+            conn.commit()
+            
+            logger.info(f'Admin deleted user: {user[0]}')
+            return {'ok': True, 'username': user[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception('delete_user failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to delete user')
+
+
+# ============================================================
+# ADMIN ENDPOINTS: SYSTEM CONFIGURATION
+# ============================================================
+
+@app.get('/admin/config')
+async def get_system_config(_admin=Depends(require_role('admin'))):
+    """Get all system configuration key-value pairs"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT key, value FROM system_config')
+            rows = cur.fetchall()
+        config = {row[0]: row[1] for row in rows}
+        return {'config': config}
+    except Exception as e:
+        logger.exception('get_system_config failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to get system config')
+
+
+@app.post('/admin/config')
+async def update_system_config(key: str = Form(...), value: str = Form(...), _admin=Depends(require_role('admin'))):
+    """Update a system configuration value"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO system_config (key, value, updated_at) 
+                VALUES (%s, %s, NOW()) 
+                ON CONFLICT (key) DO UPDATE 
+                SET value = EXCLUDED.value, updated_at = NOW()
+            ''', (key, value))
+            conn.commit()
+            logger.info(f'Admin updated system config: {key} = {value}')
+        return {'ok': True, 'key': key, 'value': value}
+    except Exception as e:
+        logger.exception('update_system_config failed: %s', e)
+        raise HTTPException(status_code=500, detail='Failed to update config')
+
+
+@app.get('/admin/ollama/models')
+async def get_ollama_models(_admin=Depends(require_role('admin'))):
+    """Fetch available Ollama embedding models from localhost:11434/api/tags
+    Filters only models suitable for embeddings (contain 'embedding' in name or are known embedding models)
+    """
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get('http://localhost:11434/api/tags')
+            response.raise_for_status()
+            data = response.json()
+            models = data.get('models', [])
+            
+            # Known embedding model patterns (not LLMs)
+            embedding_keywords = ['embedding', 'embed', 'nomic', 'bge', 'e5']
+            
+            # Filter only embedding models
+            embedding_models = []
+            for m in models:
+                name = m.get('name', '').lower()
+                if name and any(keyword in name for keyword in embedding_keywords):
+                    embedding_models.append(m.get('name', ''))
+            
+            return {'models': embedding_models, 'total': len(models), 'embedding_count': len(embedding_models)}
+    except Exception as e:
+        logger.exception('get_ollama_models failed: %s', e)
+        raise HTTPException(status_code=500, detail=f'Failed to fetch Ollama models: {str(e)}')
 
 
 @app.get('/folders/')

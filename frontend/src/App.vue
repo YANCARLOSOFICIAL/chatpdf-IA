@@ -123,6 +123,14 @@
           <span class="icon">❓</span>
           <span>Ayuda</span>
         </button>
+        <button class="footer-btn" v-if="!isAuthenticated" @click="openLogin">
+          <span class="icon">🔐</span>
+          <span>Iniciar sesión</span>
+        </button>
+        <button class="footer-btn" v-else @click="doLogout">
+          <span class="icon">🚪</span>
+          <span>Cerrar sesión</span>
+        </button>
       </div>
     </aside>
 
@@ -171,15 +179,18 @@
 
       <!-- Chat Area -->
       <div class="chat-container" :class="{ 'two-column': currentDocument }">
-        <!-- Sin documento: Mostrar área de upload -->
-        <UploadArea
-          v-if="!currentDocument"
-          v-model:embedding-type="embeddingType"
-          :is-uploading="isUploading"
-          :upload-progress="uploadProgress"
-          @upload="uploadDocument"
-          @error="showToastMessage"
-        />
+        <!-- Sin documento: Mostrar área de upload o panel de roles si autenticado -->
+        <div v-if="!currentDocument" class="no-doc-grid">
+          <UploadArea
+            v-if="!isAuthenticated"
+            :is-uploading="isUploading"
+            :upload-progress="uploadProgress"
+            @upload="uploadDocument"
+            @error="showToastMessage"
+          />
+          <RolePanels v-if="isAuthenticated" :roles="userRoles" @open-admin="openAdminSection" />
+          <AdminPanel v-if="showAdminPanel" @info="showToastMessage" @error="showToastMessage" @close="closeAdmin" />
+        </div>
 
         <!-- Con documento: PDF izquierda + chat derecha -->
         <div v-if="currentDocument" class="pdf-pane">
@@ -294,6 +305,8 @@
       @save="saveTagsForDoc"
       @update="autosaveTagsForDoc"
     />
+
+    <LoginModal :visible="showLoginModal" @close="showLoginModal = false" @login-success="onLoginSuccess" />
   </div>
 </template>
 
@@ -312,6 +325,10 @@ import ExportButton from './components/chat/ExportButton.vue';
 import ShortcutsModal from './components/ui/ShortcutsModal.vue';
 import PdfViewer from './components/PdfViewer.vue';
 import PDFHistory from './components/PDFHistory.vue';
+import LoginModal from './components/auth/LoginModal.vue';
+import RolePanels from './components/auth/RolePanels.vue';
+import AdminPanel from './components/admin/AdminPanel.vue';
+import { getToken, logout as apiLogout } from './api'
 
 export default {
   name: 'App',
@@ -330,6 +347,9 @@ export default {
     ShortcutsModal,
     PdfViewer
     ,PDFHistory
+    ,RolePanels
+    ,AdminPanel
+    ,LoginModal
   },
   data() {
     return {
@@ -343,7 +363,6 @@ export default {
   currentDocument: null,
   recentDocuments: [],
   selectedFile: null,
-  embeddingType: 'openai',
   isUploading: false,
   uploadProgress: 0,
 
@@ -374,6 +393,13 @@ export default {
 
       // Modals
       showShortcutsModal: false,
+    // Auth
+    showLoginModal: false,
+    isAuthenticated: !!getToken(),
+    currentUser: null,
+    userRoles: [],
+  showAdminPanel: false,
+  adminSection: null,
   // Tag editor
   showTagEditor: false,
   tagEditorDocId: null,
@@ -400,6 +426,8 @@ export default {
   this.loadTheme();
     this.setupDragAndDrop();
     this.setupKeyboardShortcuts();
+    // Ensure admin panel hidden on initial mount
+    this.showAdminPanel = false;
   },
 
   beforeUnmount() {
@@ -431,6 +459,16 @@ export default {
   },
 
   methods: {
+
+    openAdminSection(section) {
+      this.adminSection = section;
+      this.showAdminPanel = true;
+    },
+
+    closeAdmin() {
+      this.showAdminPanel = false;
+      this.adminSection = null;
+    },
     checkMobile() {
       this.isMobile = window.innerWidth <= 1024;
       if (!this.isMobile) {
@@ -695,7 +733,7 @@ export default {
         this.selectedFile = pdfs[0];
       } else {
         // If multiple selected, start multi-upload flow
-        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f, embeddingType: this.embeddingType })));
+        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f })));
       }
     },
 
@@ -751,14 +789,14 @@ export default {
         return;
       }
       if (pdfs.length === 1) {
-        this.uploadDocument({ file: pdfs[0], embeddingType: this.embeddingType });
+        this.uploadDocument({ file: pdfs[0] });
       } else {
-        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f, embeddingType: this.embeddingType })));
+        this.uploadMultipleDocuments(pdfs.map(f => ({ file: f })));
       }
     },
 
     async uploadMultipleDocuments(items) {
-      // items: [{file, embeddingType}, ...]
+      // items: [{file}, ...]
       const filesToUpload = [];
       const hashes = [];
 
@@ -769,11 +807,11 @@ export default {
           const hashArray = Array.from(new Uint8Array(hashBuffer));
           const fileHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
           hashes.push(fileHash);
-          filesToUpload.push({ file: it.file, embeddingType: it.embeddingType, fileHash });
+          filesToUpload.push({ file: it.file, fileHash });
         } catch (err) {
           // if hashing fails, include the file without hash
           hashes.push(null);
-          filesToUpload.push({ file: it.file, embeddingType: it.embeddingType, fileHash: null });
+          filesToUpload.push({ file: it.file, fileHash: null });
         }
       }
 
@@ -794,7 +832,6 @@ export default {
 
       // Build FormData for upload_pdfs endpoint, skipping duplicates
       const form = new FormData();
-      form.append('embedding_type', this.embeddingType);
       const fileHashesForForm = [];
       for (const f of filesToUpload) {
         if (f.fileHash && existingHashes.has(f.fileHash)) {
@@ -814,7 +851,7 @@ export default {
             if (r.status === 'uploaded') {
               this.showToastMessage(`Subido: ${r.filename}`, 'success');
               // Optionally add to recentDocuments
-              this.recentDocuments.unshift({ id: r.pdf_id, name: r.filename, pages: 0, uploadedAt: new Date().toISOString(), embeddingType: this.embeddingType, folderId: null, favorite: false, tags: [] });
+              this.recentDocuments.unshift({ id: r.pdf_id, name: r.filename, pages: 0, uploadedAt: new Date().toISOString(), folderId: null, favorite: false, tags: [] });
             } else if (r.status === 'duplicate') {
               this.showToastMessage(`Omitido (duplicado): ${r.filename}`, 'warning');
             } else {
@@ -1358,6 +1395,33 @@ export default {
     toggleTheme() {
       this.isDarkMode = !this.isDarkMode;
       this.saveTheme();
+    },
+
+    openLogin() {
+      this.showLoginModal = true;
+    },
+
+    async onLoginSuccess(token) {
+      this.isAuthenticated = true;
+      this.showToastMessage('Login correcto', 'success');
+      // Fetch user info (roles)
+      try {
+        const me = await (await import('./api')).getMe()
+        if (me && me.user) {
+          this.currentUser = me.user
+          this.userRoles = Array.isArray(me.roles) ? me.roles : (me.roles || [])
+        }
+      } catch (e) {
+        console.warn('Could not fetch user info after login', e)
+      }
+    },
+
+    doLogout() {
+      apiLogout();
+      this.isAuthenticated = false;
+      this.currentUser = null;
+      this.userRoles = [];
+      this.showToastMessage('Sesión cerrada', 'info');
     },
 
     loadTheme() {
