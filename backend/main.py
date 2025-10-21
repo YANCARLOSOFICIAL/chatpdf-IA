@@ -1,4 +1,5 @@
 
+import fastapi
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 import shutil
@@ -814,11 +815,282 @@ def get_openai_embedding(text, api_key, model="text-embedding-3-large"):
     return embedding
 def save_embedding(pdf_id, chunk, embedding, embedding_type):
     table_name = "pdf_chunks_ollama" if embedding_type == "ollama" else "pdf_chunks_openai"
+    alt_table = "pdf_chunks_openai" if table_name == "pdf_chunks_ollama" else "pdf_chunks_ollama"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"INSERT INTO {table_name} (pdf_id, chunk, embedding) VALUES (%s, %s, %s) RETURNING id", (pdf_id, chunk, embedding))
+            inserted_id = cur.fetchone()[0]
+            conn.commit()
+        return inserted_id
+    except Exception as e:
+        # If the error is due to vector dimension mismatch (Postgres/vector), try the alternate table
+        msg = str(e).lower()
+        if ('dimension' in msg) or ('expected' in msg) or ('vector' in msg) or ('expected' in msg and 'dimensions' in msg):
+            logger.warning('save_embedding: dimension mismatch inserting into %s: %s. Trying alternate table %s', table_name, e, alt_table)
+            try:
+                # Rollback the failed transaction so we can attempt a new one
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                with conn.cursor() as cur:
+                    cur.execute(f"INSERT INTO {alt_table} (pdf_id, chunk, embedding) VALUES (%s, %s, %s) RETURNING id", (pdf_id, chunk, embedding))
+                    inserted_id = cur.fetchone()[0]
+                    conn.commit()
+                # Update the pdfs.embedding_type so future searches use the correct table
+                try:
+                    new_provider = 'ollama' if alt_table == 'pdf_chunks_ollama' else 'openai'
+                    with conn.cursor() as cur2:
+                        cur2.execute('UPDATE pdfs SET embedding_type = %s WHERE id = %s', (new_provider, pdf_id))
+                        conn.commit()
+                    logger.info('save_embedding: updated pdfs.embedding_type for pdf_id=%s to %s', pdf_id, new_provider)
+                except Exception:
+                    pass
+                return inserted_id
+            except Exception as e2:
+                logger.exception('save_embedding: failed inserting into alternate table %s: %s', alt_table, e2)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        else:
+            # Not a dimension error — re-raise
+            logger.exception('save_embedding: failed inserting into %s: %s', table_name, e)
+            raise
+
+
+def reindex_pdf_to_provider(pdf_id: int, target_provider: str, ollama_model: str = None, openai_model: str = None, max_chunks: int = 1000):
+    """Attempt to (synchronously) generate embeddings for an existing PDF into the
+    target_provider's chunk table so that searches with that provider will work.
+
+    Strategy:
+    - If the target table already contains chunks for this pdf, do nothing.
+    - Otherwise, find source chunks from the other provider's table (or either table)
+      and compute embeddings with the target provider, saving them into the target table.
+    - To avoid long-running work, limit the number of chunks processed (default 1000).
+
+    Raises an Exception on failure (no source chunks, missing API key for OpenAI,
+    or if chunk count exceeds limit).
+    Returns a dict with status and counts on success.
+    """
+    target = target_provider.lower() if isinstance(target_provider, str) else target_provider
+    if target not in ('ollama', 'openai'):
+        raise Exception(f'Unsupported target provider: {target_provider}')
+
     with conn.cursor() as cur:
-        cur.execute(f"INSERT INTO {table_name} (pdf_id, chunk, embedding) VALUES (%s, %s, %s) RETURNING id", (pdf_id, chunk, embedding))
-        inserted_id = cur.fetchone()[0]
-        conn.commit()
-    return inserted_id
+        cur.execute("SELECT COUNT(*) FROM pdf_chunks_ollama WHERE pdf_id = %s", (pdf_id,))
+        ollama_cnt = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM pdf_chunks_openai WHERE pdf_id = %s", (pdf_id,))
+        openai_cnt = cur.fetchone()[0]
+
+    # If already indexed for target, nothing to do
+    if target == 'ollama' and ollama_cnt and ollama_cnt > 0:
+        return {'status': 'already_indexed', 'count': ollama_cnt, 'target': 'ollama'}
+    if target == 'openai' and openai_cnt and openai_cnt > 0:
+        return {'status': 'already_indexed', 'count': openai_cnt, 'target': 'openai'}
+
+    # Determine where to get source chunks from (prefer the opposite table)
+    source_rows = []
+    source_provider = None
+    with conn.cursor() as cur:
+        if target == 'ollama' and openai_cnt and openai_cnt > 0:
+            cur.execute("SELECT id, chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+            source_rows = cur.fetchall()
+            source_provider = 'openai'
+        elif target == 'openai' and ollama_cnt and ollama_cnt > 0:
+            cur.execute("SELECT id, chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+            source_rows = cur.fetchall()
+            source_provider = 'ollama'
+
+    # If not found, try either table as fallback
+    if not source_rows:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+            s = cur.fetchall()
+            if s:
+                source_rows = s
+                source_provider = 'ollama'
+            else:
+                cur.execute("SELECT id, chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id", (pdf_id,))
+                s2 = cur.fetchall()
+                if s2:
+                    source_rows = s2
+                    source_provider = 'openai'
+
+    if not source_rows:
+        raise Exception('No existing text chunks available to reindex for this PDF')
+
+    if len(source_rows) > max_chunks:
+        raise Exception(f'PDF has {len(source_rows)} chunks which exceeds the synchronous reindex limit ({max_chunks}). Consider re-uploading or increasing the limit.')
+
+    # Determine model names
+    if target == 'ollama':
+        model = ollama_model or 'embeddinggemma:latest'
+    else:
+        model = openai_model or 'text-embedding-3-large'
+
+    openai_api_key = os.getenv('OPENAI_API_KEY', '')
+
+    processed = 0
+    for _id, chunk in source_rows:
+        try:
+            if target == 'ollama':
+                emb = get_ollama_embedding(chunk, model=model)
+            else:
+                if not openai_api_key:
+                    raise Exception('OPENAI_API_KEY not configured; cannot generate OpenAI embeddings')
+                emb = get_openai_embedding(chunk, openai_api_key, model=model)
+
+            save_embedding(pdf_id, chunk, emb, target)
+            processed += 1
+        except Exception as e:
+            logger.warning('reindex_pdf_to_provider: failed embedding chunk id=%s: %s', _id, e)
+            # continue with rest; do not fail whole operation for a single chunk
+            continue
+
+    return {'status': 'reindexed', 'processed': processed, 'source': source_provider, 'target': target}
+
+
+def reindex_pdf_from_file(pdf_id: int, target_provider: str, max_chunks: int = 500):
+    """Re-ingest a stored PDF file and generate embeddings into the target provider.
+
+    This is a best-effort synchronous reprocessing step used by `/chat/` when a
+    PDF has no chunks stored. It will:
+    - locate uploads/pdfs/{pdf_id}.pdf
+    - extract text (PyPDF2 + OCR fallback)
+    - extract images and generate OCR/captions (best-effort)
+    - chunk the combined text, generate embeddings with the target provider,
+      save them into the appropriate chunk table, and update pdfs.embedding_type
+    - return a dict with 'processed' count
+
+    Raises Exception on failure (missing file, no text, missing API keys for OpenAI, too many chunks).
+    """
+    pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+    if not pdf_path.exists():
+        raise Exception('Original PDF file not found on disk')
+
+    # Extract text (will attempt OCR when necessary)
+    text = extract_text_from_pdf(str(pdf_path))
+
+    # If text is empty, attempt to extract images and run OCR/captions
+    if not text or len(text.strip()) < 50:
+        imgs = extract_images_from_pdf(str(pdf_path), pdf_id=pdf_id)
+        ocr_texts = []
+        captions = []
+        openai_api_key = os.getenv('OPENAI_API_KEY', '')
+        enable_ocr = True
+        enable_vision = bool(openai_api_key)
+        for img_path, page_num in imgs:
+            # OCR
+            if enable_ocr:
+                try:
+                    ocr_res = ocr_image_file(img_path)
+                    if ocr_res and len(ocr_res.strip()) > 10:
+                        ocr_texts.append(ocr_res)
+                except Exception:
+                    pass
+            # Captions
+            if enable_vision:
+                try:
+                    cap = ''
+                    if openai_api_key:
+                        cap = generate_image_with_openai(img_path, 'Describe this image briefly.', openai_api_key)
+                    if not cap:
+                        cap = generate_image_with_qwen(img_path, 'Describe this image briefly.')
+                    if cap and len(cap.strip()) > 0:
+                        captions.append(cap)
+                except Exception:
+                    pass
+
+        if ocr_texts:
+            text += "\n\n[OCR_EXTRACTED_TEXT]\n" + "\n".join(ocr_texts)
+        if captions:
+            text += "\n\n[IMAGE_CAPTIONS]\n" + "\n".join(captions)
+
+    if not text or len(text.strip()) == 0:
+        raise Exception('No textual content could be extracted from the PDF')
+
+    # Chunk and embed
+    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+    if len(chunks) > max_chunks:
+        raise Exception(f'PDF chunk count {len(chunks)} exceeds synchronous limit {max_chunks}')
+
+    # Determine model names
+    ollama_model = None
+    openai_model = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_ollama_model'")
+            r = cur.fetchone()
+            ollama_model = r[0] if r and r[0] else None
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_openai_model'")
+            r2 = cur.fetchone()
+            openai_model = r2[0] if r2 and r2[0] else None
+    except Exception:
+        pass
+
+    openai_api_key = os.getenv('OPENAI_API_KEY', '')
+    processed = 0
+    for chunk in chunks:
+        try:
+            if target_provider == 'ollama':
+                emb = get_ollama_embedding(chunk, model=ollama_model) if ollama_model else get_ollama_embedding(chunk)
+            else:
+                if not openai_api_key:
+                    raise Exception('OPENAI_API_KEY not configured; cannot generate OpenAI embeddings')
+                emb = get_openai_embedding(chunk, openai_api_key, model=openai_model) if openai_model else get_openai_embedding(chunk, openai_api_key)
+
+            save_embedding(pdf_id, chunk, emb, target_provider)
+            processed += 1
+        except Exception as e:
+            logger.warning('reindex_pdf_from_file: failed embedding chunk: %s', e)
+            continue
+
+    # Update pdfs.embedding_type to reflect that it's now indexed for this provider
+    try:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE pdfs SET embedding_type = %s WHERE id = %s', (target_provider, pdf_id))
+            conn.commit()
+    except Exception:
+        pass
+
+    # If nothing was processed for the chosen target (e.g. dimension mismatch),
+    # attempt the alternative provider automatically to improve success rate.
+    if processed == 0:
+        try:
+            alt = 'openai' if target_provider == 'ollama' else 'ollama'
+            logger.info('reindex_pdf_from_file: no chunks processed for %s, attempting alternative provider %s', target_provider, alt)
+            alt_processed = 0
+            # Re-run loop for alternative provider
+            for chunk in chunks:
+                try:
+                    if alt == 'ollama':
+                        emb = get_ollama_embedding(chunk, model=ollama_model) if ollama_model else get_ollama_embedding(chunk)
+                    else:
+                        if not openai_api_key:
+                            raise Exception('OPENAI_API_KEY not configured; cannot generate OpenAI embeddings')
+                        emb = get_openai_embedding(chunk, openai_api_key, model=openai_model) if openai_model else get_openai_embedding(chunk, openai_api_key)
+
+                    save_embedding(pdf_id, chunk, emb, alt)
+                    alt_processed += 1
+                except Exception as e:
+                    logger.warning('reindex_pdf_from_file (alt=%s): failed embedding chunk: %s', alt, e)
+                    continue
+
+            if alt_processed > 0:
+                # Update embedding_type to alt so subsequent queries pick the right table
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute('UPDATE pdfs SET embedding_type = %s WHERE id = %s', (alt, pdf_id))
+                        conn.commit()
+                except Exception:
+                    pass
+                return {'status': 'reindexed_from_file', 'processed': alt_processed, 'target': alt}
+        except Exception as e:
+            logger.warning('reindex_pdf_from_file: alternative provider attempt failed: %s', e)
+
+    return {'status': 'reindexed_from_file', 'processed': processed, 'target': target_provider}
 
 
 def save_chunk_span(chunk_table, chunk_id, pdf_id, page_number, x, y, width, height):
@@ -1065,7 +1337,22 @@ def get_pdf_embedding_type(pdf_id):
     with conn.cursor() as cur:
         cur.execute("SELECT embedding_type FROM pdfs WHERE id = %s", (pdf_id,))
         result = cur.fetchone()
-        return result[0] if result else None
+        if not result or not result[0]:
+            return None
+        try:
+            val = str(result[0]).strip().lower()
+        except Exception:
+            return None
+        # Treat various sentinel/invalid values as None
+        if val in ('', 'undefined', 'null', 'none'):
+            return None
+        # Map common names to normalized provider identifiers
+        if 'openai' in val:
+            return 'openai'
+        if 'ollama' in val or 'qwen' in val or 'embedding' in val:
+            return 'ollama'
+        # Default: return the raw (lowercased) value
+        return val
 
 def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
     """Return both chunks and metadata for provenance/evidence tracking.
@@ -1546,22 +1833,119 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
 
 @app.post("/chat/")
 async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0')):
-    # Verificar que el tipo de embedding coincida con el del PDF
+    # Normalize embedding_type and fallback to system default when necessary
+    try:
+        if embedding_type is None:
+            embedding_type = ''
+        embedding_type = embedding_type.strip().lower()
+    except Exception:
+        embedding_type = 'ollama'
+
+    # If empty or unknown, read system default
+    if embedding_type not in ('ollama', 'openai'):
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'default_embedding_type'")
+                row = cur.fetchone()
+                embedding_type = (row[0].strip().lower() if row and row[0] else 'openai')
+                logger.info(f"chat: using system default embedding_type={embedding_type}")
+        except Exception as e:
+            logger.warning(f"chat: failed reading system_config default, defaulting to openai: {e}")
+            embedding_type = 'openai'
+
+    # Determine specific model names from config (do this early so we can reindex if needed)
+    ollama_model = None
+    openai_model = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_ollama_model'")
+            r = cur.fetchone()
+            ollama_model = r[0] if r and r[0] else None
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_openai_model'")
+            r2 = cur.fetchone()
+            openai_model = r2[0] if r2 and r2[0] else None
+    except Exception:
+        # Best-effort: continue with None and let embedding callers use their defaults
+        ollama_model = ollama_model or None
+        openai_model = openai_model or None
+
+    # Verificar que el tipo de embedding coincida con el del PDF (si existe)
     pdf_embedding_type = get_pdf_embedding_type(pdf_id)
-    if pdf_embedding_type and pdf_embedding_type != embedding_type:
-        from fastapi import HTTPException
-        raise HTTPException(
-            status_code=400,
-            detail=f"⚠️ Incompatibilidad de modelos: El PDF se subió con '{pdf_embedding_type.upper()}', pero intentas usar '{embedding_type.upper()}'. Por favor, sube el PDF nuevamente con el modelo correcto."
-        )
+    if pdf_embedding_type and pdf_embedding_type.lower() != embedding_type:
+        logger.info("chat: provider mismatch (pdf=%s, requested=%s). Attempting best-effort reindex.", pdf_embedding_type, embedding_type)
+        # Try to reindex the PDF into the requested provider's chunk table.
+        try:
+            re_res = reindex_pdf_to_provider(pdf_id, embedding_type, ollama_model=ollama_model, openai_model=openai_model, max_chunks=500)
+            logger.info("chat: reindex result: %s", re_res)
+            # If reindex processed some chunks, proceed using requested provider
+            if re_res.get('processed', 0) > 0 or re_res.get('status') == 'already_indexed':
+                logger.info("chat: reindex successful or already indexed; continuing with provider %s", embedding_type)
+                # continue as normal
+            else:
+                # Reindex didn't produce usable chunks; fall back to original provider to avoid hard error
+                logger.warning("chat: reindex did not produce chunks; falling back to PDF's original provider: %s", pdf_embedding_type)
+                embedding_type = pdf_embedding_type
+        except Exception as e:
+            # If reindex fails (missing API keys, too many chunks, etc), log and fall back to original provider
+            logger.exception("chat: reindex attempt failed: %s", e)
+            embedding_type = pdf_embedding_type
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
-    if embedding_type == "ollama":
-        query_embedding = get_ollama_embedding(query)
-    elif embedding_type == "openai":
-        query_embedding = get_openai_embedding(query, openai_api_key)
+
+    # Compute query embedding using the correct provider and model. Be resilient:
+    # - Try the requested provider first
+    # - If it fails, attempt to use the PDF's original provider (pdf_embedding_type)
+    # - If both fail, return an informative 500 error
+    query_embedding = None
+    embedding_provider_used = None
+
+    def _gen_ollama(q):
+        if ollama_model:
+            return get_ollama_embedding(q, model=ollama_model)
+        return get_ollama_embedding(q)
+
+    def _gen_openai(q):
+        if openai_model:
+            return get_openai_embedding(q, openai_api_key, model=openai_model)
+        return get_openai_embedding(q, openai_api_key)
+
+    last_exc = None
+    if embedding_type == 'ollama':
+        try:
+            query_embedding = _gen_ollama(query)
+            embedding_provider_used = 'ollama'
+        except Exception as e:
+            logger.exception('chat: Ollama embedding generation failed: %s', e)
+            last_exc = e
+    elif embedding_type == 'openai':
+        try:
+            query_embedding = _gen_openai(query)
+            embedding_provider_used = 'openai'
+        except Exception as e:
+            logger.exception('chat: OpenAI embedding generation failed: %s', e)
+            last_exc = e
     else:
-        raise Exception("Tipo de embedding no soportado")
+        logger.error("chat: unsupported embedding_type '%s'", embedding_type)
+        raise fastapi.HTTPException(status_code=400, detail=f"Tipo de embedding no soportado: {embedding_type}")
+
+    # If initial attempt failed, try the PDF's original provider as fallback
+    if query_embedding is None and pdf_embedding_type and pdf_embedding_type != embedding_type:
+        try:
+            logger.info('chat: attempting fallback embedding generation using PDF original provider: %s', pdf_embedding_type)
+            if pdf_embedding_type == 'ollama':
+                query_embedding = _gen_ollama(query)
+                embedding_provider_used = 'ollama'
+            elif pdf_embedding_type == 'openai':
+                query_embedding = _gen_openai(query)
+                embedding_provider_used = 'openai'
+        except Exception as e:
+            logger.exception('chat: fallback embedding generation failed: %s', e)
+            last_exc = e
+
+    if query_embedding is None:
+        # Nothing worked — return a clear 500 error advising the admin to check services
+        logger.error('chat: failed to generate query embedding for pdf_id=%s using requested (%s) and pdf original (%s). Last error: %s', pdf_id, embedding_type, pdf_embedding_type, last_exc)
+        raise fastapi.HTTPException(status_code=500, detail='Failed to generate embeddings for the query. Check Ollama service status and OPENAI_API_KEY configuration.')
     try:
         chunks, sources = search_similar_chunks(pdf_id, query_embedding, embedding_type)
     except Exception as e:
@@ -1588,7 +1972,6 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
             ollama_chunks = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM pdf_chunks_openai WHERE pdf_id = %s", (pdf_id,))
             openai_chunks = cur.fetchone()[0]
-
         detail = {
             'message': 'No context available for this PDF. It may have failed ingestion or OCR/captions were empty.',
             'pdf_id': pdf_id,
@@ -1598,7 +1981,46 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
             'chunks_openai': openai_chunks
         }
         logger.info("Empty context diagnostics: %s", detail)
-        raise HTTPException(status_code=404, detail=detail)
+
+        # If there are no chunks for either provider, attempt a synchronous reindex from the stored PDF file
+        try:
+            if (ollama_chunks == 0 and openai_chunks == 0):
+                logger.info('chat: no chunks found for pdf_id=%s, attempting reindex from stored PDF file into provider=%s', pdf_id, embedding_type)
+                re_res = reindex_pdf_from_file(pdf_id, embedding_type, max_chunks=500)
+                logger.info('chat: reindex_from_file result: %s', re_res)
+                # If we generated some chunks, retry the search
+                if re_res.get('processed', 0) > 0:
+                        # If reindex produced chunks, switch the in-memory embedding_type
+                        # to the provider we just reindexed into and regenerate the
+                        # query embedding using that provider before searching.
+                        new_target = re_res.get('target')
+                        if new_target:
+                            embedding_type = new_target
+                            logger.info('chat: switching embedding_type to %s after reindex', embedding_type)
+                            try:
+                                # regenerate query embedding for the new provider
+                                if embedding_type == 'ollama':
+                                    query_embedding = _gen_ollama(query)
+                                else:
+                                    query_embedding = _gen_openai(query)
+                            except Exception as e:
+                                logger.exception('chat: failed to regenerate query embedding after reindex: %s', e)
+                                query_embedding = None
+
+                        try:
+                            if query_embedding is not None:
+                                chunks, sources = search_similar_chunks(pdf_id, query_embedding, embedding_type)
+                                context = "\n".join(chunks)
+                            else:
+                                logger.warning('chat: no query_embedding available to search after reindex')
+                        except Exception as e:
+                            logger.exception('chat: failed search after reindex: %s', e)
+        except Exception as e:
+            logger.warning('chat: reindex_from_file attempt failed: %s', e)
+
+        if not context.strip():
+            # After attempting reindex, still no context available
+            raise fastapi.HTTPException(status_code=404, detail=detail)
 
     # VLM-Enhanced Query Mode: Check if PDF has images stored in DB
     # If yes, load them and their stored captions for summaries. We'll also support
