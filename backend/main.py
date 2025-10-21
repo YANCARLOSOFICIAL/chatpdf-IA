@@ -180,6 +180,41 @@ def init_db_schema():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        
+        # Conversations table - stores chat sessions per user per PDF
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                pdf_id INTEGER REFERENCES pdfs(id) ON DELETE CASCADE,
+                title TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        
+        # Messages table - stores individual messages in conversations
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sources JSONB,
+                page_number INTEGER,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        
+        # Add user_id to pdfs table if not exists (to track who uploaded)
+        try:
+            cur.execute("ALTER TABLE pdfs ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)")
+        except Exception:
+            try:
+                cur.execute("ALTER TABLE pdfs ADD COLUMN user_id INTEGER REFERENCES users(id)")
+            except Exception:
+                pass
+        
         conn.commit()
         
         # Insert default system configuration
@@ -365,6 +400,25 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
         if not r:
             raise HTTPException(status_code=401, detail='User not found')
         return {'id': r[0], 'username': r[1]}
+
+def get_current_user_optional(creds: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
+    """Obtiene el usuario actual si está autenticado, o None si no lo está"""
+    if not creds:
+        return None
+    try:
+        token = creds.credentials
+        data = decode_access_token(token)
+        user_id = data.get('user_id')
+        if not user_id:
+            return None
+        with conn.cursor() as cur:
+            cur.execute('SELECT id, username FROM users WHERE id = %s', (user_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {'id': r[0], 'username': r[1]}
+    except Exception:
+        return None
 
 def require_role(role_name: str):
     def _dep(user = Depends(get_current_user)):
@@ -1106,12 +1160,12 @@ def create_pdf_entry(filename, embedding_type):
     return create_pdf_entry_with_hash(filename, embedding_type, None)
 
 
-def create_pdf_entry_with_hash(filename, embedding_type, file_hash=None):
+def create_pdf_entry_with_hash(filename, embedding_type, file_hash=None, user_id=None):
     with conn.cursor() as cur:
         if file_hash:
-            cur.execute("INSERT INTO pdfs (filename, embedding_type, hash) VALUES (%s, %s, %s) RETURNING id", (filename, embedding_type, file_hash))
+            cur.execute("INSERT INTO pdfs (filename, embedding_type, hash, user_id) VALUES (%s, %s, %s, %s) RETURNING id", (filename, embedding_type, file_hash, user_id))
         else:
-            cur.execute("INSERT INTO pdfs (filename, embedding_type) VALUES (%s, %s) RETURNING id", (filename, embedding_type))
+            cur.execute("INSERT INTO pdfs (filename, embedding_type, user_id) VALUES (%s, %s, %s) RETURNING id", (filename, embedding_type, user_id))
         pdf_id = cur.fetchone()[0]
         conn.commit()
     return pdf_id
@@ -1408,7 +1462,7 @@ def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
     return chunks, sources
 
 @app.post("/upload_pdf/")
-async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(None), file_hash: str = Form(None)):
+async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(None), file_hash: str = Form(None), user = Depends(get_current_user)):
     # If no embedding_type provided, use system default
     if not embedding_type or embedding_type.strip() == '':
         try:
@@ -1426,7 +1480,7 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(Non
         logger.error(f"Invalid embedding_type received: '{embedding_type}'")
         embedding_type = 'openai'
     
-    logger.info(f"Final embedding_type for upload: {embedding_type}")
+    logger.info(f"Final embedding_type for upload: {embedding_type}, user_id={user['id']}")
     
     # Read bytes and compute hash if not provided
     file_bytes = await pdf.read()
@@ -1494,8 +1548,8 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(Non
     logger.info("Extracted base text length: %d chars", len(text))
     
     # Create PDF entry first to get pdf_id for image storage
-    pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash)
-    logger.info("Created PDF entry with id=%d", pdf_id)
+    pdf_id = create_pdf_entry_with_hash(pdf.filename, embedding_type, file_hash, user_id=user['id'])
+    logger.info("Created PDF entry with id=%d, user_id=%d", pdf_id, user['id'])
     # Persist the uploaded PDF immediately so it is always available for viewing
     try:
         uploads_pdf_dir = Path(__file__).resolve().parent / 'uploads' / 'pdfs'
@@ -1832,7 +1886,7 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
 
 
 @app.post("/chat/")
-async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0')):
+async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0'), conversation_id: int = Form(None), user = Depends(get_current_user)):
     # Normalize embedding_type and fallback to system default when necessary
     try:
         if embedding_type is None:
@@ -2274,13 +2328,175 @@ Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualq
         suggested_questions = []
     suggested_questions = [str(s).strip() for s in suggested_questions if str(s).strip()][:3]
 
+    # Save conversation and messages to database
+    try:
+        # Get or create conversation
+        if not conversation_id:
+            # Create new conversation with title based on first query
+            title = query[:100] if len(query) <= 100 else query[:97] + "..."
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO conversations (user_id, pdf_id, title) VALUES (%s, %s, %s) RETURNING id",
+                    (user['id'], pdf_id, title)
+                )
+                conversation_id = cur.fetchone()[0]
+                conn.commit()
+                logger.info("Created new conversation id=%d for user=%d, pdf=%d", conversation_id, user['id'], pdf_id)
+        else:
+            # Validate conversation belongs to user
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,))
+                row = cur.fetchone()
+                if not row or row[0] != user['id']:
+                    raise HTTPException(status_code=403, detail="Conversation does not belong to user")
+        
+        # Save user message
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (%s, %s, %s)",
+                (conversation_id, 'user', query)
+            )
+            conn.commit()
+        
+        # Save assistant message with sources
+        import json
+        sources_json = json.dumps(sources) if sources else None
+        page_number = sources[0].get('page') if sources and len(sources) > 0 and 'page' in sources[0] else None
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content, sources, page_number) VALUES (%s, %s, %s, %s, %s)",
+                (conversation_id, 'assistant', answer, sources_json, page_number)
+            )
+            conn.commit()
+        
+        # Update conversation timestamp
+        with conn.cursor() as cur:
+            cur.execute("UPDATE conversations SET updated_at = NOW() WHERE id = %s", (conversation_id,))
+            conn.commit()
+        
+        logger.info("Saved messages to conversation id=%d", conversation_id)
+    except Exception as e:
+        logger.exception("Failed to save conversation: %s", e)
+        # Don't fail the entire request if saving fails
+
     return {
         "response": answer,
         "used_vlm_enhanced": bool(used_vlm_enhanced and len(images_analyzed) > 0),
         "images_analyzed": images_analyzed,
         "sources": sources,  # Evidence/provenance for frontend
-        "suggested_questions": suggested_questions
+        "suggested_questions": suggested_questions,
+        "conversation_id": conversation_id
     }
+
+
+# ============ CONVERSATION HISTORY ENDPOINTS ============
+
+@app.get("/conversations/")
+async def get_conversations(user = Depends(get_current_user)):
+    """Get all conversations for the authenticated user"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.id, c.pdf_id, c.title, c.created_at, c.updated_at, p.filename as pdf_filename
+                FROM conversations c
+                LEFT JOIN pdfs p ON c.pdf_id = p.id
+                WHERE c.user_id = %s
+                ORDER BY c.updated_at DESC
+            """, (user['id'],))
+            
+            rows = cur.fetchall()
+            conversations = []
+            for row in rows:
+                conversations.append({
+                    'id': row[0],
+                    'pdf_id': row[1],
+                    'title': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None,
+                    'updated_at': row[4].isoformat() if row[4] else None,
+                    'pdf_filename': row[5]
+                })
+            
+            return {"conversations": conversations}
+    except Exception as e:
+        logger.exception("Error getting conversations: %s", e)
+        raise HTTPException(status_code=500, detail="Error al obtener conversaciones")
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: int, user = Depends(get_current_user)):
+    """Get all messages for a specific conversation"""
+    try:
+        # Verify conversation belongs to user
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            if row[0] != user['id']:
+                raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Get messages
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, role, content, sources, page_number, created_at
+                FROM messages
+                WHERE conversation_id = %s
+                ORDER BY created_at ASC
+            """, (conversation_id,))
+            
+            rows = cur.fetchall()
+            messages = []
+            for row in rows:
+                import json
+                sources = json.loads(row[3]) if row[3] else []
+                messages.append({
+                    'id': row[0],
+                    'role': row[1],
+                    'content': row[2],
+                    'sources': sources,
+                    'page_number': row[4],
+                    'created_at': row[5].isoformat() if row[5] else None
+                })
+            
+            return {"messages": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error getting messages: %s", e)
+        raise HTTPException(status_code=500, detail="Error al obtener mensajes")
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: int, user = Depends(get_current_user)):
+    """Delete a conversation and all its messages"""
+    try:
+        # Verify conversation belongs to user
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            if row[0] != user['id']:
+                raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Delete messages first (foreign key constraint)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
+            conn.commit()
+        
+        # Delete conversation
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+            conn.commit()
+        
+        logger.info("Deleted conversation id=%d for user=%d", conversation_id, user['id'])
+        return {"status": "success", "message": "Conversation deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error deleting conversation: %s", e)
+        raise HTTPException(status_code=500, detail="Error al eliminar conversación")
 
 
 @app.get('/pdfs/{pdf_id}/debug')
@@ -2555,28 +2771,69 @@ async def set_document_metadata(pdf_id: int, metadata: str = Form(...)):
 
 
 @app.get("/pdfs/")
-async def list_pdfs(folder_id: int = None, name: str = None, hash: str = None):
+async def list_pdfs(folder_id: int = None, name: str = None, hash: str = None, user = Depends(get_current_user_optional)):
+    # Si no hay usuario autenticado, no mostrar PDFs (requiere autenticación)
+    if not user:
+        return {'pdfs': []}
+    
+    # Verificar si el usuario es admin
+    is_admin = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT r.name FROM roles r JOIN user_roles ur ON r.id = ur.role_id WHERE ur.user_id = %s', (user['id'],))
+            roles = [r[0] for r in cur.fetchall()]
+            is_admin = 'admin' in roles
+    except Exception:
+        pass
+    
     # Fetch PDFs from database with optional folder_id or exact name filter
+    # Los usuarios normales solo ven sus PDFs, los admins ven todos
     with conn.cursor() as cur:
         if hash:
             # exact hash match
-            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE hash = %s ORDER BY id DESC", (hash,))
+            if is_admin:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE hash = %s ORDER BY id DESC", (hash,))
+            else:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE hash = %s AND user_id = %s ORDER BY id DESC", (hash, user['id']))
         elif name:
             # exact filename match (case-insensitive)
-            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE LOWER(filename) = LOWER(%s) ORDER BY id DESC", (name,))
+            if is_admin:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE LOWER(filename) = LOWER(%s) ORDER BY id DESC", (name,))
+            else:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE LOWER(filename) = LOWER(%s) AND user_id = %s ORDER BY id DESC", (name, user['id']))
         elif folder_id is None:
-            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs ORDER BY id DESC")
+            if is_admin:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs ORDER BY id DESC")
+            else:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE user_id = %s ORDER BY id DESC", (user['id'],))
         else:
-            cur.execute("SELECT id, filename, embedding_type, folder_id, hash FROM pdfs WHERE folder_id = %s ORDER BY id DESC", (folder_id,))
+            if is_admin:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE folder_id = %s ORDER BY id DESC", (folder_id,))
+            else:
+                cur.execute("SELECT id, filename, embedding_type, folder_id, hash, user_id FROM pdfs WHERE folder_id = %s AND user_id = %s ORDER BY id DESC", (folder_id, user['id']))
         rows = cur.fetchall()
 
     results = []
     for r in rows:
-        pdf_id, filename, embedding_type, folder_val, file_hash = r
+        pdf_id, filename, embedding_type, folder_val, file_hash, user_id = r
         meta = get_pdf_metadata_from_db(pdf_id)
+        
+        # Intentar obtener el número de páginas del PDF almacenado
+        pages = 0
+        try:
+            pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+            if pdf_path.exists():
+                import PyPDF2
+                with open(pdf_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    pages = len(pdf_reader.pages)
+        except Exception:
+            pass
+        
         entry = {
             'id': pdf_id,
             'name': filename,
+            'pages': pages,
             'embeddingType': embedding_type,
             'folderId': folder_val,
             'hash': file_hash,
@@ -2661,6 +2918,23 @@ async def delete_pdf(pdf_id: int):
         pass
 
     return {"ok": True}
+
+
+@app.get('/pdfs/{pdf_id}/file')
+async def get_pdf_file(pdf_id: int):
+    """Serve the PDF file for viewing"""
+    from fastapi.responses import FileResponse
+    
+    pdf_path = Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf"
+    
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found")
+    
+    return FileResponse(
+        path=str(pdf_path),
+        media_type='application/pdf',
+        filename=f"{pdf_id}.pdf"
+    )
 
 
 @app.get('/pdfs/{pdf_id}/images/{page_num}')
@@ -3149,3 +3423,98 @@ async def admin_fill_hashes():
         updated.append({'id': pdf_id, 'hash': file_hash})
 
     return {'updated': updated, 'count': len(updated)}
+
+
+# ============================================================================
+# Endpoints de conversaciones (historial de chat por usuario)
+# ============================================================================
+
+@app.get('/conversations/')
+async def list_conversations(user = Depends(get_current_user)):
+    """Lista todas las conversaciones del usuario autenticado"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.id, c.pdf_id, c.title, c.created_at, c.updated_at, p.filename
+            FROM conversations c
+            LEFT JOIN pdfs p ON c.pdf_id = p.id
+            WHERE c.user_id = %s
+            ORDER BY c.updated_at DESC
+        """, (user['id'],))
+        rows = cur.fetchall()
+    
+    conversations = []
+    for row in rows:
+        conversations.append({
+            'id': row[0],
+            'pdf_id': row[1],
+            'title': row[2],
+            'created_at': row[3].isoformat() if row[3] else None,
+            'updated_at': row[4].isoformat() if row[4] else None,
+            'pdf_filename': row[5]
+        })
+    
+    return {'conversations': conversations}
+
+
+@app.get('/conversations/{conversation_id}/messages')
+async def get_conversation_messages(conversation_id: int, user = Depends(get_current_user)):
+    """Obtiene todos los mensajes de una conversación"""
+    # Verificar que la conversación pertenece al usuario
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id, pdf_id FROM conversations WHERE id = %s", (conversation_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversación no encontrada")
+        if row[0] != user['id']:
+            raise HTTPException(status_code=403, detail="No tienes permiso para acceder a esta conversación")
+        pdf_id = row[1]
+    
+    # Obtener mensajes
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, role, content, sources, page_number, created_at
+            FROM messages
+            WHERE conversation_id = %s
+            ORDER BY created_at ASC
+        """, (conversation_id,))
+        rows = cur.fetchall()
+    
+    messages = []
+    for row in rows:
+        import json
+        sources = json.loads(row[3]) if row[3] else []
+        messages.append({
+            'id': row[0],
+            'role': row[1],
+            'content': row[2],
+            'sources': sources,
+            'page_number': row[4],
+            'created_at': row[5].isoformat() if row[5] else None
+        })
+    
+    return {
+        'conversation_id': conversation_id,
+        'pdf_id': pdf_id,
+        'messages': messages
+    }
+
+
+@app.delete('/conversations/{conversation_id}')
+async def delete_conversation(conversation_id: int, user = Depends(get_current_user)):
+    """Elimina una conversación y todos sus mensajes"""
+    # Verificar que la conversación pertenece al usuario
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Conversación no encontrada")
+        if row[0] != user['id']:
+            raise HTTPException(status_code=403, detail="No tienes permiso para eliminar esta conversación")
+    
+    # Eliminar conversación (los mensajes se eliminan en cascada)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+        conn.commit()
+    
+    return {'success': True, 'message': 'Conversación eliminada correctamente'}
+

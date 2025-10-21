@@ -25,6 +25,17 @@
         </div>
       </div>
 
+      <!-- Panel de usuario -->
+      <div v-if="isAuthenticated && currentUser" class="user-panel">
+        <div class="user-info">
+          <div class="user-avatar">{{ currentUser.username ? currentUser.username.charAt(0).toUpperCase() : 'U' }}</div>
+          <div class="user-details">
+            <div class="user-name">{{ currentUser.username }}</div>
+            <div class="user-role">{{ userRoles.join(', ') || 'usuario' }}</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Filtro por etiqueta -->
       <div v-if="uniqueTags.length > 0" class="tag-filter" style="padding: 8px 12px;">
         <div style="color:#9ca3af; font-size:12px; margin-bottom:8px;">Filtrar por etiqueta</div>
@@ -38,6 +49,12 @@
       <button class="new-chat-btn" @click="startNewChat">
         <span class="icon">➕</span>
         <span>Nuevo Chat</span>
+      </button>
+
+      <!-- Historial de Conversaciones Button -->
+      <button v-if="isAuthenticated" class="history-btn" @click="showConversationHistory = true" title="Ver historial de conversaciones">
+        <span class="icon">📚</span>
+        <span>Historial</span>
       </button>
 
       <!-- Documentos Recientes -->
@@ -89,7 +106,7 @@
       <!-- Botón para ver historial de conversaciones -->
       <div v-if="currentDocument" class="history-section">
         <button 
-          class="history-btn"
+          class="history-btn-section"
           @click="showConversationsPanel = !showConversationsPanel"
           :class="{ 'active': showConversationsPanel }"
         >
@@ -179,16 +196,15 @@
 
       <!-- Chat Area -->
       <div class="chat-container" :class="{ 'two-column': currentDocument }">
-        <!-- Sin documento: Mostrar área de upload o panel de roles si autenticado -->
+        <!-- Sin documento: Mostrar área de upload -->
         <div v-if="!currentDocument" class="no-doc-grid">
           <UploadArea
-            v-if="!isAuthenticated"
             :is-uploading="isUploading"
             :upload-progress="uploadProgress"
             @upload="uploadDocument"
             @error="showToastMessage"
           />
-          <RolePanels v-if="isAuthenticated" :roles="userRoles" @open-admin="openAdminSection" />
+          <RolePanels v-if="isAuthenticated && !showAdminPanel" :roles="userRoles" @open-admin="openAdminSection" />
           <AdminPanel v-if="showAdminPanel" @info="showToastMessage" @error="showToastMessage" @close="closeAdmin" />
         </div>
 
@@ -307,6 +323,18 @@
     />
 
     <LoginModal :visible="showLoginModal" @close="showLoginModal = false" @login-success="onLoginSuccess" />
+
+    <!-- Modal de Historial de Conversaciones -->
+    <div v-if="showConversationHistory" class="modal-overlay" @click="showConversationHistory = false">
+      <div class="modal-content history-modal" @click.stop>
+        <ConversationHistory
+          :active-conversation-id="currentConversationId"
+          @close="showConversationHistory = false"
+          @load-conversation="loadConversationFromHistory"
+          @conversation-deleted="onConversationDeleted"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -328,6 +356,7 @@ import PDFHistory from './components/PDFHistory.vue';
 import LoginModal from './components/auth/LoginModal.vue';
 import RolePanels from './components/auth/RolePanels.vue';
 import AdminPanel from './components/admin/AdminPanel.vue';
+import ConversationHistory from './components/ConversationHistory.vue';
 import { getToken, logout as apiLogout } from './api'
 
 export default {
@@ -350,6 +379,7 @@ export default {
     ,RolePanels
     ,AdminPanel
     ,LoginModal
+    ,ConversationHistory
   },
   data() {
     return {
@@ -383,6 +413,7 @@ export default {
       conversations: [],
       currentConversationId: null,
       showConversationsPanel: false,
+      showConversationHistory: false,
 
       // Toast
       toast: {
@@ -419,15 +450,24 @@ export default {
   mounted() {
     this.checkMobile();
     window.addEventListener('resize', this.checkMobile);
-  this.loadRecentDocuments();
-  this.loadDocumentsFromBackend();
-  this.loadFolders();
-  this.loadConversations();
   this.loadTheme();
     this.setupDragAndDrop();
     this.setupKeyboardShortcuts();
     // Ensure admin panel hidden on initial mount
     this.showAdminPanel = false;
+    
+    // Solo cargar datos si el usuario está autenticado
+    if (this.isAuthenticated) {
+      this.loadUserInfo();
+      this.loadDocumentsFromBackend();
+      this.loadFolders();
+    } else {
+      // Si no está autenticado, limpiar todo
+      this.recentDocuments = [];
+      this.currentDocument = null;
+      this.messages = [];
+      this.conversations = [];
+    }
   },
 
   beforeUnmount() {
@@ -511,7 +551,9 @@ export default {
     },
 
     saveRecentDocuments() {
-      localStorage.setItem('chatpdf-documents', JSON.stringify(this.recentDocuments));
+      // Ya no guardamos en localStorage, todo viene del backend
+      // Esta función se mantiene para no romper el código existente que la llama
+      // pero no hace nada
     },
 
     // Folders management
@@ -918,43 +960,65 @@ export default {
         }, 200);
 
         if (fileHash) formData.append('file_hash', fileHash);
+        
+        // Obtener token de autenticación
+        const token = localStorage.getItem('chatpdf_token');
+        if (!token) {
+          throw new Error('Debes iniciar sesión para subir documentos');
+        }
+
         const response = await fetch('http://localhost:8000/upload_pdf/', {
           method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          },
           body: formData
         });
 
         clearInterval(progressInterval);
         this.uploadProgress = 100;
 
+        if (response.status === 401) {
+          this.showLoginModal = true;
+          throw new Error('Tu sesión ha expirado. Por favor, inicia sesión nuevamente');
+        }
+
         if (!response.ok) {
-          throw new Error('Error al subir el PDF');
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.detail || 'Error al subir el PDF');
         }
 
         const data = await response.json();
         
-        const newDoc = {
-          id: data.pdf_id,
-          name: file.name,
-          pages: 45, // Podrías obtener esto del backend
-          date: 'Hoy',
-          uploadedAt: new Date().toISOString(),
-          embeddingType: embeddingType,
-          folderId: this.activeFolderId || null,
-          favorite: false,
-          tags: []
-        };
-
-        this.currentDocument = newDoc;
+        // Recargar la lista de documentos desde el backend
+        await this.loadDocumentsFromBackend();
         
-        // Agregar a documentos recientes
-        this.recentDocuments.unshift(newDoc);
-        if (this.recentDocuments.length > 10) {
-          this.recentDocuments = this.recentDocuments.slice(0, 10);
+        // Buscar el documento recién subido en la lista actualizada
+        const uploadedDoc = this.recentDocuments.find(doc => doc.id === data.pdf_id);
+        
+        if (uploadedDoc) {
+          // Usar selectDocument para configurar correctamente el visor PDF
+          await this.selectDocument(uploadedDoc);
+        } else {
+          // Si no se encuentra en la lista, crear el documento manualmente
+          const newDoc = {
+            id: data.pdf_id,
+            name: file.name,
+            pages: 0,
+            date: 'Hoy',
+            uploadedAt: new Date().toISOString(),
+            embeddingType: embeddingType,
+            folderId: this.activeFolderId || null,
+            favorite: false,
+            tags: []
+          };
+          
+          this.recentDocuments.unshift(newDoc);
+          this.saveRecentDocuments();
+          
+          // Usar selectDocument para configurar correctamente el visor PDF
+          await this.selectDocument(newDoc);
         }
-        this.saveRecentDocuments();
-
-        // Cargar conversaciones del nuevo documento
-        this.loadConversations();
 
         this.showToastMessage('PDF subido exitosamente', 'success');
         
@@ -1142,17 +1206,17 @@ export default {
         this.saveCurrentConversation();
       }
 
-      // Crear nueva conversación
+      // Limpiar conversación y cerrar documento para permitir subir nuevo PDF
       this.currentConversationId = null;
       this.messages = [];
       this.messageInput = '';
+      this.currentDocument = null;
       
-      if (!this.currentDocument) {
-        this.showToastMessage('Sube un PDF para comenzar', 'info');
-      }
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
+      
+      this.showToastMessage('Sube un PDF para comenzar un nuevo chat', 'info');
     },
 
     // Conversation Methods
@@ -1234,6 +1298,73 @@ export default {
       this.showConversationsPanel = false;
     },
 
+    // Métodos para el historial de conversaciones del backend
+    async loadConversationFromHistory(conversation) {
+      try {
+        // Cerrar el modal
+        this.showConversationHistory = false;
+
+        // Obtener mensajes de la conversación desde el backend
+        const token = localStorage.getItem('chatpdf_token');
+        if (!token) {
+          throw new Error('No autenticado');
+        }
+
+        const response = await fetch(`http://localhost:8000/conversations/${conversation.id}/messages`, {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error('Error al cargar mensajes');
+        }
+
+        const data = await response.json();
+
+        // Cargar el documento asociado si no está cargado
+        if (!this.currentDocument || this.currentDocument.id !== conversation.pdf_id) {
+          const doc = this.recentDocuments.find(d => d.id === conversation.pdf_id);
+          if (doc) {
+            await this.selectDocument(doc);
+          } else {
+            // Cargar documento desde el backend si no está en la lista
+            await this.loadDocumentsFromBackend();
+            const loadedDoc = this.recentDocuments.find(d => d.id === conversation.pdf_id);
+            if (loadedDoc) {
+              await this.selectDocument(loadedDoc);
+            }
+          }
+        }
+
+        // Cargar los mensajes
+        this.messages = data.messages.map(msg => ({
+          role: msg.role,
+          content: msg.content,
+          sources: msg.sources || [],
+          timestamp: new Date(msg.created_at)
+        }));
+
+        this.currentConversationId = conversation.id;
+        this.showToastMessage(`Conversación cargada: ${conversation.title}`, 'success');
+
+        // Scroll al final
+        this.$nextTick(() => {
+          this.scrollToBottom();
+        });
+      } catch (error) {
+        console.error('Error cargando conversación:', error);
+        this.showToastMessage('Error al cargar la conversación', 'error');
+      }
+    },
+
+    onConversationDeleted(conversationId) {
+      // Si la conversación eliminada es la actual, limpiar el chat
+      if (this.currentConversationId === conversationId) {
+        this.startNewChat();
+      }
+    },
+
     deleteConversation(conversationId) {
       if (!confirm('¿Estás seguro de eliminar esta conversación?')) return;
 
@@ -1289,9 +1420,22 @@ export default {
   // Ask backend for suggested questions only for the first assistant response in a new conversation
   const hasAssistantResponses = this.messages.some(m => m.role === 'assistant');
   formData.append('include_suggestions', hasAssistantResponses ? '0' : '1');
+  
+  // Enviar conversation_id si existe
+  if (this.currentConversationId) {
+    formData.append('conversation_id', this.currentConversationId);
+  }
+
+        // Obtener token de autenticación
+        const token = localStorage.getItem('chatpdf_token');
+        const headers = {};
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
 
         const response = await fetch('http://localhost:8000/chat/', {
           method: 'POST',
+          headers: headers,
           body: formData
         });
 
@@ -1312,6 +1456,11 @@ export default {
         };
 
         this.messages.push(assistantMessage);
+        
+        // Actualizar conversation_id si el backend lo devuelve
+        if (data.conversation_id) {
+          this.currentConversationId = data.conversation_id;
+        }
         
         // Auto-guardar conversación después de cada respuesta
         this.saveCurrentConversation();
@@ -1404,7 +1553,13 @@ export default {
     async onLoginSuccess(token) {
       this.isAuthenticated = true;
       this.showToastMessage('Login correcto', 'success');
-      // Fetch user info (roles)
+      await this.loadUserInfo();
+      
+      // Cargar documentos del usuario desde el backend
+      await this.loadDocumentsFromBackend();
+    },
+
+    async loadUserInfo() {
       try {
         const me = await (await import('./api')).getMe()
         if (me && me.user) {
@@ -1412,7 +1567,7 @@ export default {
           this.userRoles = Array.isArray(me.roles) ? me.roles : (me.roles || [])
         }
       } catch (e) {
-        console.warn('Could not fetch user info after login', e)
+        console.warn('Could not fetch user info', e)
       }
     },
 
@@ -1421,6 +1576,26 @@ export default {
       this.isAuthenticated = false;
       this.currentUser = null;
       this.userRoles = [];
+      
+      // Limpiar documentos y estado
+      this.currentDocument = null;
+      this.recentDocuments = [];
+      this.messages = [];
+      this.conversations = [];
+      this.currentConversationId = null;
+      this.messageInput = '';
+      this.pdfViewerUrl = '';
+      
+      // Limpiar localStorage
+      localStorage.removeItem('chatpdf-documents');
+      
+      // Limpiar todas las conversaciones guardadas en localStorage
+      Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('conversations_')) {
+          localStorage.removeItem(key);
+        }
+      });
+      
       this.showToastMessage('Sesión cerrada', 'info');
     },
 
@@ -1587,6 +1762,19 @@ export default {
 
 #app.light-mode .sidebar-header {
   border-bottom-color: #e2e8f0;
+}
+
+#app.light-mode .user-panel {
+  border-bottom-color: #e2e8f0;
+  background: rgba(77, 108, 250, 0.03);
+}
+
+#app.light-mode .user-name {
+  color: #1a202c;
+}
+
+#app.light-mode .user-role {
+  color: #718096;
 }
 
 #app.light-mode .logo-text {
@@ -1856,6 +2044,56 @@ export default {
   letter-spacing: -0.5px;
 }
 
+/* User Panel */
+.user-panel {
+  padding: 16px 20px;
+  border-bottom: 1px solid #1e2640;
+  background: rgba(77, 108, 250, 0.05);
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.user-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4d6cfa, #5a7bff);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.user-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.user-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e4e6eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-role {
+  font-size: 12px;
+  color: #9ca3af;
+  text-transform: capitalize;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* New Chat Button */
 .new-chat-btn {
   margin: 20px;
@@ -1882,6 +2120,33 @@ export default {
 }
 
 .new-chat-btn .icon {
+  font-size: 18px;
+}
+
+.history-btn {
+  margin: 0 20px 20px;
+  padding: 12px 20px;
+  background: transparent;
+  border: 2px solid #4d6cfa;
+  border-radius: 8px;
+  color: #4d6cfa;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: all 0.2s;
+}
+
+.history-btn:hover {
+  background: #4d6cfa;
+  color: white;
+  transform: translateY(-1px);
+}
+
+.history-btn .icon {
   font-size: 18px;
 }
 
@@ -3049,6 +3314,47 @@ select,
   height: auto;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   border-radius: 4px;
+}
+
+/* Modal de Historial de Conversaciones */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  padding: 20px;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 12px;
+  max-width: 100%;
+  max-height: 90vh;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  animation: modalFadeIn 0.2s ease-out;
+}
+
+.modal-content.history-modal {
+  width: 600px;
+  height: 70vh;
+}
+
+@keyframes modalFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 .error-msg {
