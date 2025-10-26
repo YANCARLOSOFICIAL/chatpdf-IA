@@ -103,28 +103,7 @@
         @delete="deletePdf"
       />
 
-      <!-- Botón para ver historial de conversaciones -->
-      <div v-if="currentDocument" class="history-section">
-        <button 
-          class="history-btn-section"
-          @click="showConversationsPanel = !showConversationsPanel"
-          :class="{ 'active': showConversationsPanel }"
-        >
-          <span class="icon">📚</span>
-          <span>Historial de Conversaciones</span>
-          <span class="badge" v-if="conversations.length > 0">{{ conversations.length }}</span>
-        </button>
-      </div>
-
-      <!-- Conversaciones del documento actual (colapsable) -->
-      <ConversationList
-        v-if="currentDocument && showConversationsPanel && conversations.length > 0"
-        :conversations="conversations"
-        :active-conversation-id="currentConversationId"
-        @select="selectConversation"
-        @new="newConversation"
-        @delete="deleteConversation"
-      />
+      <!-- Historial de conversaciones ahora disponible en el modal (backend) -->
 
       <!-- Footer -->
       <div class="sidebar-footer">
@@ -343,7 +322,6 @@ import DragOverlay from './components/ui/DragOverlay.vue';
 import DocumentList from './components/sidebar/DocumentList.vue';
 import FolderList from './components/sidebar/FolderList.vue';
 import TagEditor from './components/sidebar/TagEditor.vue';
-import ConversationList from './components/sidebar/ConversationList.vue';
 import UploadArea from './components/chat/UploadArea.vue';
 import WelcomeMessage from './components/chat/WelcomeMessage.vue';
 import ChatMessage from './components/chat/ChatMessage.vue';
@@ -366,7 +344,7 @@ export default {
   DocumentList,
   FolderList,
   TagEditor,
-    ConversationList,
+  // ConversationList removed: using backend ConversationHistory instead
     UploadArea,
     WelcomeMessage,
     ChatMessage,
@@ -410,9 +388,8 @@ export default {
 
   // Conversations
     showPdfHistory: false,
-      conversations: [],
-      currentConversationId: null,
-      showConversationsPanel: false,
+  // conversations are loaded from backend ConversationHistory; localStorage-based list removed
+  currentConversationId: null,
       showConversationHistory: false,
 
       // Toast
@@ -440,8 +417,7 @@ export default {
   pdfViewerUrl: '',
   pdfViewerStartPage: 1,
 
-      // Sidebar helpers
-      showConversationsPanel: false,
+  // Sidebar helpers (local conversations removed)
       // Starter suggested questions fetched when opening a document
       suggestedQuestions: []
     };
@@ -466,7 +442,6 @@ export default {
       this.recentDocuments = [];
       this.currentDocument = null;
       this.messages = [];
-      this.conversations = [];
     }
   },
 
@@ -659,8 +634,7 @@ export default {
         // load documents for this folder from backend
         this.loadDocumentsFromBackend(folderId);
       }
-      // Close conversations panel when switching folders
-      this.showConversationsPanel = false;
+  // local conversations panel removed (backend modal used instead)
     },
 
     openTagsPanel(docId) {
@@ -1201,102 +1175,21 @@ export default {
     },
 
     startNewChat() {
-      // Guardar conversación actual si hay mensajes
-      if (this.messages.length > 0 && this.currentDocument) {
-        this.saveCurrentConversation();
-      }
-
       // Limpiar conversación y cerrar documento para permitir subir nuevo PDF
       this.currentConversationId = null;
       this.messages = [];
       this.messageInput = '';
       this.currentDocument = null;
-      
+
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
-      
+
       this.showToastMessage('Sube un PDF para comenzar un nuevo chat', 'info');
     },
 
-    // Conversation Methods
-    loadConversations() {
-      if (!this.currentDocument) {
-        this.conversations = [];
-        return;
-      }
-
-      const stored = localStorage.getItem(`conversations_${this.currentDocument.id}`);
-      this.conversations = stored ? JSON.parse(stored) : [];
-    },
-
-    saveCurrentConversation() {
-      if (!this.currentDocument || this.messages.length === 0) return;
-
-      const conversation = {
-        id: this.currentConversationId || Date.now(),
-        title: this.generateConversationTitle(),
-        messages: this.messages,
-        messageCount: this.messages.length,
-        date: new Date().toLocaleDateString('es-ES'),
-        timestamp: new Date()
-      };
-
-      // Actualizar o agregar conversación
-      const index = this.conversations.findIndex(c => c.id === conversation.id);
-      if (index !== -1) {
-        this.conversations[index] = conversation;
-      } else {
-        this.conversations.unshift(conversation);
-      }
-
-      // Limitar a 20 conversaciones por documento
-      if (this.conversations.length > 20) {
-        this.conversations = this.conversations.slice(0, 20);
-      }
-
-      // Guardar en localStorage
-      localStorage.setItem(
-        `conversations_${this.currentDocument.id}`,
-        JSON.stringify(this.conversations)
-      );
-
-      this.currentConversationId = conversation.id;
-    },
-
-    generateConversationTitle() {
-      // Usar el primer mensaje del usuario como título
-      const firstUserMessage = this.messages.find(m => m.role === 'user');
-      if (firstUserMessage) {
-        const title = firstUserMessage.content.slice(0, 40);
-        return title.length < firstUserMessage.content.length ? title + '...' : title;
-      }
-      return `Conversación ${new Date().toLocaleTimeString('es-ES')}`;
-    },
-
-    selectConversation(conversation) {
-      // Guardar conversación actual antes de cambiar
-      if (this.messages.length > 0 && this.currentConversationId) {
-        this.saveCurrentConversation();
-      }
-
-      // Cargar conversación seleccionada
-      this.currentConversationId = conversation.id;
-      this.messages = conversation.messages || [];
-      this.showToastMessage(`Conversación cargada: ${conversation.title}`, 'info');
-
-      // Cerrar el panel de conversaciones después de seleccionar
-      this.showConversationsPanel = false;
-
-      if (this.isMobile) {
-        this.sidebarOpen = false;
-      }
-    },
-
-    newConversation() {
-      this.startNewChat();
-      this.showConversationsPanel = false;
-    },
+    // Conversation methods: localStorage-based conversation list removed.
+    // Conversation persistence is handled by the backend ConversationHistory component/endpoints.
 
     // Métodos para el historial de conversaciones del backend
     async loadConversationFromHistory(conversation) {
@@ -1365,27 +1258,7 @@ export default {
       }
     },
 
-    deleteConversation(conversationId) {
-      if (!confirm('¿Estás seguro de eliminar esta conversación?')) return;
-
-      this.conversations = this.conversations.filter(c => c.id !== conversationId);
-      
-      // Guardar cambios
-      if (this.currentDocument) {
-        localStorage.setItem(
-          `conversations_${this.currentDocument.id}`,
-          JSON.stringify(this.conversations)
-        );
-      }
-
-      // Si se eliminó la conversación actual, limpiar
-      if (this.currentConversationId === conversationId) {
-        this.messages = [];
-        this.currentConversationId = null;
-      }
-
-      this.showToastMessage('Conversación eliminada', 'success');
-    },
+    // Local deleteConversation removed; use backend ConversationHistory modal to delete conversations.
 
     // Chat Methods
     async sendMessage() {
@@ -1581,20 +1454,13 @@ export default {
       this.currentDocument = null;
       this.recentDocuments = [];
       this.messages = [];
-      this.conversations = [];
       this.currentConversationId = null;
       this.messageInput = '';
       this.pdfViewerUrl = '';
       
       // Limpiar localStorage
       localStorage.removeItem('chatpdf-documents');
-      
-      // Limpiar todas las conversaciones guardadas en localStorage
-      Object.keys(localStorage).forEach(key => {
-        if (key.startsWith('conversations_')) {
-          localStorage.removeItem(key);
-        }
-      });
+      // localStorage-based conversation storage removed; backend stores conversations
       
       this.showToastMessage('Sesión cerrada', 'info');
     },

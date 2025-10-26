@@ -2449,7 +2449,24 @@ async def get_conversation_messages(conversation_id: int, user = Depends(get_cur
             messages = []
             for row in rows:
                 import json
-                sources = json.loads(row[3]) if row[3] else []
+                raw_sources = row[3]
+                sources = []
+                if raw_sources:
+                    try:
+                        # psycopg2 may already decode JSON/JSONB into Python list/dict
+                        if isinstance(raw_sources, (list, dict)):
+                            sources = raw_sources
+                        elif isinstance(raw_sources, (bytes, bytearray)):
+                            sources = json.loads(raw_sources.decode('utf-8'))
+                        elif isinstance(raw_sources, str):
+                            sources = json.loads(raw_sources)
+                        else:
+                            # Fallback: try to coerce to string then parse
+                            sources = json.loads(str(raw_sources))
+                    except Exception as _exc:
+                        logger.warning("Could not parse message sources for message id=%s: %s - raw=%r", row[0], _exc, raw_sources)
+                        sources = []
+
                 messages.append({
                     'id': row[0],
                     'role': row[1],
