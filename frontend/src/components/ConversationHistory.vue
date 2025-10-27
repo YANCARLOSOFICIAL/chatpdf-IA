@@ -25,7 +25,8 @@
         <div class="conversation-info">
           <div class="conversation-title">{{ conv.title }}</div>
           <div class="conversation-meta">
-            <span class="pdf-name">📄 {{ conv.pdf_filename || 'Sin documento' }}</span>
+            <span v-if="conv.type === 'folder'" class="folder-badge">📁 {{ conv.folder_name || 'Carpeta' }}</span>
+            <span v-else class="pdf-name">📄 {{ conv.pdf_filename || 'Sin documento' }}</span>
             <span class="date">{{ formatDate(conv.updated_at) }}</span>
           </div>
         </div>
@@ -261,6 +262,17 @@ export default {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.folder-badge {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6fb0ff;
+  background: rgba(111, 176, 255, 0.15);
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-weight: 500;
 }
 
 .date {

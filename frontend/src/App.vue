@@ -77,6 +77,7 @@
         @delete="deleteFolder"
         @drop="({ docId, folderId }) => moveDocumentToFolder(docId, folderId)"
         @select-document="selectDocument"
+        @chat-folder="chatWithFolder"
       />
 
       <!-- Filtro por carpeta (DocumentList pregunta por activeFolderId) -->
@@ -151,7 +152,8 @@
     <!-- Main Content -->
     <main class="main-content">
       <!-- Header con info del documento -->
-      <header v-if="currentDocument" class="main-header">
+      <!-- Header para documento individual -->
+      <header v-if="currentDocument && !currentFolder" class="main-header">
         <button class="close-btn" @click="closeDocument">✕</button>
         <div class="doc-info-header">
           <span class="label">DOCUMENTO ACTUAL</span>
@@ -173,22 +175,46 @@
         </div>
       </header>
 
+      <!-- Header para carpeta -->
+      <header v-if="currentFolder && !currentDocument" class="main-header">
+        <button class="close-btn" @click="closeDocument">✕</button>
+        <div class="doc-info-header">
+          <span class="label">CARPETA ACTUAL</span>
+          <div class="doc-name-header">
+            <span class="icon">📁</span>
+            <span class="name">{{ currentFolder.name }}</span>
+          </div>
+        </div>
+        <div class="doc-actions">
+          <div class="doc-pages folder-stats">
+            <span class="icon">📄</span>
+            <span>{{ recentDocuments.filter(d => d.folderId === currentFolder.id).length }} documentos</span>
+          </div>
+          <ExportButton 
+            :messages="messages"
+            :document-name="`Carpeta_${currentFolder.name}`"
+            @export="handleExport"
+          />
+        </div>
+      </header>
+
       <!-- Chat Area -->
-      <div class="chat-container" :class="{ 'two-column': currentDocument }">
-        <!-- Sin documento: Mostrar área de upload -->
-        <div v-if="!currentDocument" class="no-doc-grid">
+      <div class="chat-container" :class="{ 'two-column': currentDocument || currentFolder }">
+        <!-- Sin documento ni carpeta: Mostrar área de upload -->
+        <div v-if="!currentDocument && !currentFolder" class="no-doc-grid">
           <UploadArea
             :is-uploading="isUploading"
             :upload-progress="uploadProgress"
             @upload="uploadDocument"
+            @upload-folder="uploadFolder"
             @error="showToastMessage"
           />
           <RolePanels v-if="isAuthenticated && !showAdminPanel" :roles="userRoles" @open-admin="openAdminSection" />
           <AdminPanel v-if="showAdminPanel" @info="showToastMessage" @error="showToastMessage" @close="closeAdmin" />
         </div>
 
-        <!-- Con documento: PDF izquierda + chat derecha -->
-        <div v-if="currentDocument" class="pdf-pane">
+        <!-- Con documento: PDF izquierda -->
+        <div v-if="currentDocument && !currentFolder" class="pdf-pane">
           <PdfViewer 
             ref="embeddedPdfViewer" 
             mode="embedded" 
@@ -197,12 +223,40 @@
           />
         </div>
 
-        <!-- Con documento: Mostrar chat -->
-        <div v-if="currentDocument" class="chat-area">
+        <!-- Con carpeta: Mostrar lista de documentos en lugar de PDF -->
+        <div v-if="currentFolder && !currentDocument" class="folder-documents-pane">
+          <div class="folder-documents-header">
+            <h3>📁 Documentos en {{ currentFolder.name }}</h3>
+            <span class="doc-count">{{ recentDocuments.filter(d => d.folderId === currentFolder.id).length }} PDFs</span>
+          </div>
+          <div class="folder-documents-list">
+            <div 
+              v-for="doc in recentDocuments.filter(d => d.folderId === currentFolder.id)" 
+              :key="doc.id"
+              class="folder-doc-card"
+              @click="selectDocument(doc)"
+            >
+              <div class="doc-icon">📄</div>
+              <div class="doc-details">
+                <div class="doc-title">{{ doc.name }}</div>
+                <div class="doc-meta">
+                  <span v-if="doc.pages">{{ doc.pages }} páginas</span>
+                  <span v-if="doc.uploadedAt">{{ formatDate(doc.uploadedAt) }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Chat area (para documento o carpeta) -->
+        <div v-if="currentDocument || currentFolder" class="chat-area">
           <!-- Mensajes -->
           <div class="messages-container" ref="messagesContainer">
             <!-- Mensaje de bienvenida -->
-            <WelcomeMessage v-if="messages.length === 0" />
+            <WelcomeMessage 
+              v-if="messages.length === 0" 
+              :message="currentFolder ? `¡Listo! Puedes hacer preguntas sobre cualquiera de los ${recentDocuments.filter(d => d.folderId === currentFolder.id).length} documentos en esta carpeta.` : '¡Hola! Haz preguntas sobre este documento y te ayudaré a analizarlo.'"
+            />
             <div v-if="messages.length === 0 && suggestedQuestions && suggestedQuestions.length" class="suggested-questions">
               <div class="sugg-title">Sugerencias:</div>
               <div class="sugg-list">
@@ -369,6 +423,7 @@ export default {
 
   // Document State
   currentDocument: null,
+  currentFolder: null,  // Nueva propiedad para carpetas
   recentDocuments: [],
   selectedFile: null,
   isUploading: false,
@@ -1008,6 +1063,108 @@ export default {
       }
     },
 
+    async uploadFolder(payload) {
+      const { files, folderName } = payload;
+      console.log('uploadFolder called with:', { folderName, fileCount: files?.length });
+      console.log('uploadFolder files:', files?.map(f => ({ name: f.name, size: f.size, type: f.type })));
+      
+      if (!files || files.length === 0) return;
+
+      try {
+        this.isUploading = true;
+        this.uploadProgress = 10;
+
+        // Create FormData with all PDFs and folder name
+        const formData = new FormData();
+        formData.append('folder_name', folderName);
+
+        for (const file of files) {
+          formData.append('pdfs', file, file.name);
+          console.log(`uploadFolder: Added file to FormData: ${file.name}`);
+        }
+
+        console.log(`uploadFolder: FormData prepared with ${files.length} files`);
+        this.uploadProgress = 30;
+
+        // Get authentication token
+        const token = localStorage.getItem('chatpdf_token');
+        const headers = {};
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+
+        // Call new backend endpoint that creates folder and uploads all PDFs
+        const response = await fetch('http://localhost:8000/upload_folder/', {
+          method: 'POST',
+          headers: headers,
+          body: formData
+        });
+
+        this.uploadProgress = 80;
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.detail || 'Error al subir la carpeta');
+        }
+
+        const data = await response.json();
+        this.uploadProgress = 100;
+
+        // Refresh folders and documents
+        this.loadFolders();
+        await this.loadDocumentsFromBackend();
+
+        // Show detailed results
+        const uploaded = data.uploaded_count;
+        const total = data.total_files;
+        const duplicates = data.results.filter(r => r.status === 'duplicate').length;
+        const errors = data.results.filter(r => r.status === 'error').length;
+
+        let message = `Carpeta "${folderName}": ${uploaded} subidos`;
+        if (duplicates > 0) {
+          message += `, ${duplicates} duplicados (ya existen)`;
+        }
+        if (errors > 0) {
+          message += `, ${errors} con errores`;
+        }
+        
+        this.showToastMessage(message, uploaded > 0 ? 'success' : 'warning');
+
+        // Show details of duplicates and errors if any
+        if (duplicates > 0 || errors > 0) {
+          const details = [];
+          data.results.forEach(r => {
+            if (r.status === 'duplicate') {
+              details.push(`❌ ${r.filename} (ya existe)`);
+            } else if (r.status === 'error') {
+              details.push(`⚠️ ${r.filename} (error: ${r.detail})`);
+            }
+          });
+          if (details.length > 0) {
+            console.log('Detalles de carga de carpeta:', details.join('\n'));
+          }
+        }
+
+        // Optionally open the folder chat immediately
+        if (data.folder_id) {
+          const newFolder = this.folders.find(f => f.id === data.folder_id);
+          if (newFolder) {
+            await this.chatWithFolder(newFolder);
+          }
+        }
+
+        setTimeout(() => {
+          this.uploadProgress = 0;
+        }, 1000);
+      } catch (error) {
+        console.error('Error:', error);
+        this.showToastMessage(error.message || 'Error al subir la carpeta', 'error');
+        this.uploadProgress = 0;
+      } finally {
+        this.isUploading = false;
+      }
+    },
+
     async selectDocument(doc) {
       // Guardar conversación actual antes de cambiar de documento
       if (this.messages.length > 0 && this.currentDocument) {
@@ -1159,14 +1316,62 @@ export default {
       }
     },
 
+    async chatWithFolder(folder) {
+      // Guardar conversación actual antes de cambiar de contexto
+      if (this.messages.length > 0 && this.currentDocument) {
+        this.saveCurrentConversation();
+      }
+
+      // Verificar que la carpeta tenga PDFs
+      const folderPdfs = this.recentDocuments.filter(d => d.folderId === folder.id);
+      if (!folderPdfs || folderPdfs.length === 0) {
+        this.showToastMessage('Esta carpeta no tiene PDFs', 'warning');
+        return;
+      }
+
+      // Limpiar estado de documento individual
+      this.currentDocument = null;
+      this.pdfViewerUrl = '';
+      
+      // Establecer carpeta actual
+      this.currentFolder = folder;
+      this.messages = [];
+      this.currentConversationId = null;
+      this.suggestedQuestions = [];
+      
+      // Usar el embedding_type del primer PDF de la carpeta como referencia
+      this.embeddingType = folderPdfs[0].embeddingType || 'openai';
+      
+      if (this.isMobile) {
+        this.sidebarOpen = false;
+      }
+      
+      this.showToastMessage(`Chat iniciado con carpeta "${folder.name}" (${folderPdfs.length} PDFs)`, 'info');
+
+      // Cargar sugerencias de preguntas para la carpeta
+      try {
+        const resp = await fetch(`http://localhost:8000/folders/${folder.id}/suggest_questions`);
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.suggested_questions && Array.isArray(data.suggested_questions)) {
+            this.suggestedQuestions = data.suggested_questions.slice(0, 3);
+          }
+        }
+      } catch (e) {
+        console.warn('No se pudieron obtener sugerencias para la carpeta', e);
+      }
+    },
+
     closeDocument() {
       this.currentDocument = null;
+      this.currentFolder = null;
       this.messages = [];
       this.messageInput = '';
     },
 
     changePDF() {
       this.currentDocument = null;
+      this.currentFolder = null;
       this.messages = [];
       this.messageInput = '';
     },
@@ -1177,12 +1382,13 @@ export default {
       this.messages = [];
       this.messageInput = '';
       this.currentDocument = null;
+      this.currentFolder = null;
 
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
 
-      this.showToastMessage('Sube un PDF para comenzar un nuevo chat', 'info');
+      this.showToastMessage('Sube un PDF o selecciona una carpeta para comenzar un nuevo chat', 'info');
     },
 
     // Conversation methods: localStorage-based conversation list removed.
@@ -1212,8 +1418,20 @@ export default {
 
         const data = await response.json();
 
-        // Cargar el documento asociado si no está cargado
-        if (!this.currentDocument || this.currentDocument.id !== conversation.pdf_id) {
+        // Determinar si es conversación de carpeta o PDF individual
+        if (conversation.type === 'folder' && conversation.folder_id) {
+          // Es una conversación de carpeta
+          const folder = this.folders.find(f => f.id === conversation.folder_id);
+          if (folder) {
+            this.currentFolder = folder;
+            this.currentDocument = null;
+            this.pdfViewerUrl = '';
+          } else {
+            throw new Error('Carpeta no encontrada');
+          }
+        } else if (conversation.pdf_id) {
+          // Es una conversación de PDF individual
+          this.currentFolder = null;
           const doc = this.recentDocuments.find(d => d.id === conversation.pdf_id);
           if (doc) {
             await this.selectDocument(doc);
@@ -1223,6 +1441,8 @@ export default {
             const loadedDoc = this.recentDocuments.find(d => d.id === conversation.pdf_id);
             if (loadedDoc) {
               await this.selectDocument(loadedDoc);
+            } else {
+              throw new Error('Documento no encontrado');
             }
           }
         }
@@ -1236,7 +1456,8 @@ export default {
         }));
 
         this.currentConversationId = conversation.id;
-        this.showToastMessage(`Conversación cargada: ${conversation.title}`, 'success');
+        const contextName = conversation.type === 'folder' ? `carpeta "${conversation.folder_name}"` : `documento "${conversation.title}"`;
+        this.showToastMessage(`Conversación cargada: ${contextName}`, 'success');
 
         // Scroll al final
         this.$nextTick(() => {
@@ -1259,7 +1480,7 @@ export default {
 
     // Chat Methods
     async sendMessage() {
-      if (!this.messageInput.trim() || !this.currentDocument) return;
+      if (!this.messageInput.trim() || (!this.currentDocument && !this.currentFolder)) return;
 
       const userMessage = {
         role: 'user',
@@ -1283,18 +1504,30 @@ export default {
       });
 
       try {
-  const formData = new FormData();
-  formData.append('query', query);
-  formData.append('pdf_id', this.currentDocument.id);
-  formData.append('embedding_type', this.embeddingType);
-  // Ask backend for suggested questions only for the first assistant response in a new conversation
-  const hasAssistantResponses = this.messages.some(m => m.role === 'assistant');
-  formData.append('include_suggestions', hasAssistantResponses ? '0' : '1');
-  
-  // Enviar conversation_id si existe
-  if (this.currentConversationId) {
-    formData.append('conversation_id', this.currentConversationId);
-  }
+        const formData = new FormData();
+        formData.append('query', query);
+        
+        // Determinar si es chat con PDF individual o carpeta
+        const isFolderChat = !!this.currentFolder;
+        const endpoint = isFolderChat ? 'http://localhost:8000/chat_folder/' : 'http://localhost:8000/chat/';
+        
+        if (isFolderChat) {
+          formData.append('folder_id', this.currentFolder.id);
+        } else {
+          formData.append('pdf_id', this.currentDocument.id);
+        }
+        
+        formData.append('embedding_type', this.embeddingType || 'openai');
+        
+        // Ask backend for suggested questions only for PDF chat (not folder chat) and only for first message
+        const hasAssistantResponses = this.messages.some(m => m.role === 'assistant');
+        const shouldIncludeSuggestions = !isFolderChat && !hasAssistantResponses;
+        formData.append('include_suggestions', shouldIncludeSuggestions ? '1' : '0');
+        
+        // Enviar conversation_id si existe
+        if (this.currentConversationId) {
+          formData.append('conversation_id', this.currentConversationId);
+        }
 
         // Obtener token de autenticación
         const token = localStorage.getItem('chatpdf_token');
@@ -1303,7 +1536,7 @@ export default {
           headers['Authorization'] = `Bearer ${token}`;
         }
 
-        const response = await fetch('http://localhost:8000/chat/', {
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: headers,
           body: formData
@@ -1322,7 +1555,11 @@ export default {
           sources: data.sources || [],  // Evidence/provenance from backend
           usedVlmEnhanced: data.used_vlm_enhanced || false,
           imagesAnalyzed: data.images_analyzed || [],
-          suggestedQuestions: data.suggested_questions || []
+          suggestedQuestions: data.suggested_questions || [],
+          folderInfo: isFolderChat ? {
+            pdfCount: data.pdf_count,
+            pdfNames: data.pdf_names
+          } : null
         };
 
         this.messages.push(assistantMessage);
@@ -1360,6 +1597,19 @@ export default {
       if (!timestamp) return '';
       const date = new Date(timestamp);
       return date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+    },
+
+    formatDate(dateString) {
+      if (!dateString) return '';
+      const date = new Date(dateString);
+      const today = new Date();
+      const diffTime = Math.abs(today - date);
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      
+      if (diffDays === 0) return 'Hoy';
+      if (diffDays === 1) return 'Ayer';
+      if (diffDays < 7) return `Hace ${diffDays} días`;
+      return date.toLocaleDateString('es-ES', { year: 'numeric', month: 'short', day: 'numeric' });
     },
 
     showToastMessage(message, type = 'info') {
@@ -1592,9 +1842,9 @@ export default {
 
     // Guardar la conversación actual (cuando se cambia de documento o se cierra)
     async saveCurrentConversation() {
-      // Si hay mensajes y documento actual, la conversación ya se guardó automáticamente
+      // Si hay mensajes y documento o carpeta actual, la conversación ya se guardó automáticamente
       // en cada respuesta. Este método es un safety check.
-      if (!this.currentDocument || !this.messages || this.messages.length === 0) {
+      if ((!this.currentDocument && !this.currentFolder) || !this.messages || this.messages.length === 0) {
         return;
       }
       // La conversación ya fue guardada durante sendMessage
@@ -2311,6 +2561,107 @@ export default {
   flex-direction: column;
 }
 
+/* Folder documents pane - similar to PDF pane but shows document list */
+.folder-documents-pane {
+  width: 45%;
+  min-width: 400px;
+  border-right: 1px solid #1e2640;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: #0f1226;
+}
+
+.folder-documents-header {
+  padding: 20px;
+  border-bottom: 1px solid #1e2640;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #151934;
+}
+
+.folder-documents-header h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #e4e6eb;
+  margin: 0;
+}
+
+.doc-count {
+  font-size: 12px;
+  color: #9ca3af;
+  background: #1e2640;
+  padding: 4px 12px;
+  border-radius: 12px;
+}
+
+.folder-documents-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.folder-doc-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: #151934;
+  border: 1px solid #1e2640;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.folder-doc-card:hover {
+  background: #1e2640;
+  border-color: #4d6cfa;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(77, 108, 250, 0.2);
+}
+
+.folder-doc-card .doc-icon {
+  font-size: 32px;
+  flex-shrink: 0;
+}
+
+.folder-doc-card .doc-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.folder-doc-card .doc-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e4e6eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
+}
+
+.folder-doc-card .doc-meta {
+  font-size: 12px;
+  color: #9ca3af;
+  display: flex;
+  gap: 12px;
+}
+
+.folder-doc-card .doc-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.folder-stats {
+  background: rgba(77, 108, 250, 0.1);
+  color: #4d6cfa;
+}
+
 .chat-container.two-column .chat-area {
   width: 55%;
   flex: 1;
@@ -2322,7 +2673,7 @@ export default {
     flex-direction: column;
   }
   
-  .pdf-pane {
+  .pdf-pane, .folder-documents-pane {
     width: 100%;
     height: 40vh;
     border-right: none;

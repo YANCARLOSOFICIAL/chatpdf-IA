@@ -21,6 +21,7 @@
         <span class="folder-chevron" v-if="activeFolderId === folder.id">▾</span>
         <span class="folder-chevron" v-else>▸</span>
         <div class="folder-name">{{ folder.name }}</div>
+        <button class="chat-folder-btn" @click.stop="$emit('chat-folder', folder)" title="Chatear con esta carpeta">💬</button>
         <button class="del-btn" @click.stop="$emit('delete', folder.id)" title="Eliminar carpeta">✕</button>
 
         <!-- Expanded docs for this folder -->
@@ -46,7 +47,7 @@ export default {
     activeFolderId: { type: [String, Number], default: null },
     documents: { type: Array, default: () => [] }
   },
-  emits: ['select', 'new', 'delete', 'drop', 'select-document'],
+  emits: ['select', 'new', 'delete', 'drop', 'select-document', 'chat-folder'],
   data() {
     return {
       hoverFolderId: null
@@ -127,6 +128,20 @@ export default {
 
 .folder-icon { font-size: 16px; }
 .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-folder-btn {
+  background: transparent;
+  border: 1px solid #4d6cfa;
+  color: #4d6cfa;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+.chat-folder-btn:hover {
+  background: #4d6cfa;
+  color: white;
+}
 .del-btn { background: transparent; border: none; color: #6b7280; cursor: pointer; }
 
 .empty-folders { color: #6b7280; padding: 8px 0; }

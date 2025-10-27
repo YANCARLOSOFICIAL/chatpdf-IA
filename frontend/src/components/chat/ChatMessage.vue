@@ -31,8 +31,9 @@
               <span class="source-icon">�</span>
               <span class="source-label">
                 <span class="source-main">
-                  <span v-if="source.page">Página {{ source.page }}</span>
-                  <span v-else>Referencia {{ idx + 1 }}</span>
+                  <span v-if="source.pdf_name" class="pdf-name-badge">{{ source.pdf_name }}</span>
+                  <span v-if="source.page">Pág. {{ source.page }}</span>
+                  <span v-else>Ref. {{ idx + 1 }}</span>
                 </span>
                 <span v-if="source.location" class="location-badge">{{ source.location }}</span>
               </span>
@@ -520,6 +521,22 @@ export default {
 .source-main {
   font-size: 13px;
   font-weight: 600;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pdf-name-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: #6fb0ff;
+  background: rgba(111, 176, 255, 0.15);
+  padding: 2px 6px;
+  border-radius: 4px;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .location-badge {

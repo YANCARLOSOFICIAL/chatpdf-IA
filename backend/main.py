@@ -181,7 +181,7 @@ def init_db_schema():
             )
         ''')
         
-        # Conversations table - stores chat sessions per user per PDF
+        # Conversations table - stores chat sessions per user per PDF or folder
         cur.execute('''
             CREATE TABLE IF NOT EXISTS conversations (
                 id SERIAL PRIMARY KEY,
@@ -192,6 +192,15 @@ def init_db_schema():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        
+        # Add folder_id column to conversations for folder-wide chats
+        try:
+            cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE")
+        except Exception:
+            try:
+                cur.execute("ALTER TABLE conversations ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE")
+            except Exception:
+                pass
         
         # Messages table - stores individual messages in conversations
         cur.execute('''
@@ -2089,6 +2098,202 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
     return {'results': results}
 
 
+@app.post('/upload_folder/')
+async def upload_folder(
+    folder_name: str = Form(...),
+    pdfs: list[UploadFile] = File(...),
+    embedding_type: str = Form(None),
+    user = Depends(get_current_user)
+):
+    """Upload a complete folder with multiple PDFs.
+    Creates a new folder and uploads all PDFs to it.
+    Returns folder_id and upload results.
+    """
+    # If no embedding_type provided, use system default
+    if not embedding_type or embedding_type.strip() == '':
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'default_embedding_type'")
+                row = cur.fetchone()
+                embedding_type = row[0] if row and row[0] else 'openai'
+                logger.info(f"upload_folder: using embedding_type from config: {embedding_type}")
+        except Exception as e:
+            logger.warning(f"upload_folder: could not read system_config, defaulting to 'openai': {e}")
+            embedding_type = 'openai'
+    
+    # Validate embedding_type
+    if embedding_type not in ['openai', 'ollama']:
+        logger.error(f"upload_folder: invalid embedding_type received: '{embedding_type}'")
+        embedding_type = 'openai'
+    
+    logger.info(f"upload_folder: folder_name={folder_name}, pdfs_count={len(pdfs)}, embedding_type={embedding_type}")
+    
+    # Filter only PDF files
+    pdf_files = [pdf for pdf in pdfs if pdf.filename.lower().endswith('.pdf')]
+    
+    if len(pdf_files) == 0:
+        raise HTTPException(status_code=400, detail="No se encontraron archivos PDF en la carpeta")
+    
+    # Create folder first
+    folder_id = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO folders (name) VALUES (%s) RETURNING id", (folder_name,))
+            folder_id = cur.fetchone()[0]
+            conn.commit()
+            logger.info(f"upload_folder: created folder with id={folder_id}")
+    except Exception as e:
+        logger.exception(f"upload_folder: failed to create folder: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al crear la carpeta: {str(e)}")
+    
+    # Now upload all PDFs to this folder
+    results = []
+    uploaded_count = 0
+    
+    logger.info(f"upload_folder: Starting to process {len(pdf_files)} PDF files")
+    for idx, pdf in enumerate(pdf_files):
+        logger.info(f"upload_folder: Processing file {idx+1}/{len(pdf_files)}: {pdf.filename}")
+        try:
+            file_bytes = await pdf.read()
+            computed_hash = hashlib.sha256(file_bytes).hexdigest()
+            logger.info(f"upload_folder: File '{pdf.filename}' hash: {computed_hash}")
+            
+            # Quick check by hash (skip duplicates)
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM pdfs WHERE hash = %s", (computed_hash,))
+                existing = cur.fetchone()
+                if existing:
+                    logger.warning(f"upload_folder: File '{pdf.filename}' is duplicate (hash exists as pdf_id={existing[0]})")
+                    results.append({'filename': pdf.filename, 'status': 'duplicate', 'reason': 'hash_exists'})
+                    continue
+            
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            
+            text = extract_text_from_pdf(tmp_path)
+            logger.info(f"upload_folder: PDF '{pdf.filename}': Extracted text length: {len(text)} chars")
+            
+            # Create PDF entry with folder_id and user_id
+            pdf_id = None
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pdfs (filename, embedding_type, hash, folder_id, user_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (pdf.filename, embedding_type, computed_hash, folder_id, user['id'])
+                )
+                pdf_id = cur.fetchone()[0]
+                conn.commit()
+            logger.info(f"upload_folder: PDF '{pdf.filename}': Created entry with id={pdf_id}")
+            
+            # Extract images and process
+            try:
+                image_data = extract_images_from_pdf(tmp_path, pdf_id=pdf_id)
+                logger.info(f"upload_folder: PDF '{pdf.filename}': Found {len(image_data)} images")
+                
+                ocr_texts = []
+                captions = []
+                openai_api_key = os.getenv('OPENAI_API_KEY', '')
+                enable_ocr = os.getenv('ENABLE_OCR', 'true').lower() == 'true'
+                enable_vision = os.getenv('ENABLE_VISION_CAPTIONS', 'false').lower() == 'true' or bool(openai_api_key)
+                
+                for image_path, page_num in image_data:
+                    # Save image reference
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO pdf_images (pdf_id, image_path, page_number) VALUES (%s, %s, %s)",
+                            (pdf_id, image_path, page_num)
+                        )
+                        conn.commit()
+                    
+                    # OCR
+                    if enable_ocr:
+                        ocr_result = ocr_image_file(image_path)
+                        if ocr_result and len(ocr_result.strip()) > 10:
+                            ocr_texts.append(ocr_result)
+                    
+                    # Vision captions
+                    if enable_vision:
+                        try:
+                            caption_prompt = "Describe this image briefly and highlight important visual elements. If there are any texts, formulas or charts, summarize them."
+                            cap = ''
+                            if openai_api_key:
+                                cap = generate_image_with_openai(image_path, caption_prompt, openai_api_key)
+                            if not cap:
+                                cap = generate_image_with_qwen(image_path, caption_prompt)
+                            if cap and len(cap.strip()) > 0:
+                                captions.append(cap)
+                        except Exception as e:
+                            logger.warning(f"upload_folder: skipping caption for image: {e}")
+                
+                if ocr_texts:
+                    text += "\n\n[OCR_EXTRACTED_TEXT]\n" + "\n".join(ocr_texts)
+                if captions:
+                    text += "\n\n[IMAGE_CAPTIONS]\n" + "\n".join(captions)
+                
+                logger.info(f"upload_folder: PDF '{pdf.filename}': Final text length: {len(text)} chars")
+            except Exception as e:
+                logger.exception(f"upload_folder: error processing images for '{pdf.filename}': {e}")
+            
+            # Save PDF file
+            try:
+                uploads_pdf_dir = Path(__file__).resolve().parent / 'uploads' / 'pdfs'
+                uploads_pdf_dir.mkdir(parents=True, exist_ok=True)
+                dest_pdf = uploads_pdf_dir / f"{pdf_id}.pdf"
+                shutil.move(tmp_path, str(dest_pdf))
+                logger.info(f"upload_folder: saved PDF permanently to: {dest_pdf}")
+            except Exception as e:
+                logger.warning(f"upload_folder: failed to save PDF file: {e}")
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
+            
+            # Create chunks and embeddings
+            chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+            openai_api_key = os.getenv("OPENAI_API_KEY", "")
+            
+            for chunk in chunks:
+                if embedding_type == "ollama":
+                    embedding = get_ollama_embedding(chunk)
+                elif embedding_type == "openai":
+                    embedding = get_openai_embedding(chunk, openai_api_key)
+                else:
+                    raise Exception("Tipo de embedding no soportado")
+                
+                try:
+                    inserted_chunk_id = save_embedding(pdf_id, chunk, embedding, embedding_type)
+                except Exception:
+                    inserted_chunk_id = None
+                
+                # Map chunk to bbox
+                try:
+                    pdf_path = str(Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf")
+                    if inserted_chunk_id and os.path.exists(pdf_path):
+                        map_chunk_to_bbox(pdf_path, chunk, inserted_chunk_id, 
+                                        'pdf_chunks_ollama' if embedding_type=='ollama' else 'pdf_chunks_openai', 
+                                        pdf_id)
+                except Exception as e:
+                    logger.warning(f"upload_folder: error in map_chunk_to_bbox: {e}")
+            
+            results.append({'filename': pdf.filename, 'status': 'uploaded', 'pdf_id': pdf_id})
+            uploaded_count += 1
+            logger.info(f"upload_folder: Successfully uploaded '{pdf.filename}' as pdf_id={pdf_id}")
+            
+        except Exception as e:
+            logger.exception(f"upload_folder: error uploading '{pdf.filename}': {e}")
+            results.append({'filename': pdf.filename, 'status': 'error', 'detail': str(e)})
+    
+    logger.info(f"upload_folder: Completed processing. Uploaded {uploaded_count} of {len(pdf_files)} files")
+    return {
+        'folder_id': folder_id,
+        'folder_name': folder_name,
+        'uploaded_count': uploaded_count,
+        'total_files': len(pdf_files),
+        'results': results
+    }
+
+
 @app.post("/chat/")
 async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0'), conversation_id: int = Form(None), user = Depends(get_current_user)):
     # Normalize embedding_type and fallback to system default when necessary
@@ -2734,6 +2939,342 @@ El contexto incluye texto extraído marcado con [SOURCE_N] al inicio de cada blo
     }
 
 
+# ============ FOLDER CHAT ENDPOINT ============
+
+@app.post("/chat_folder/")
+async def chat_folder(query: str = Form(...), folder_id: int = Form(...), embedding_type: str = Form("ollama"), include_suggestions: str = Form('0'), conversation_id: int = Form(None), user = Depends(get_current_user)):
+    """Chat with all PDFs in a folder. This searches across all documents and combines results."""
+    import re
+    import json
+    
+    # Normalize embedding_type and fallback to system default when necessary
+    try:
+        if embedding_type is None:
+            embedding_type = ''
+        embedding_type = embedding_type.strip().lower()
+    except Exception:
+        embedding_type = 'ollama'
+
+    # If empty or unknown, read system default
+    if embedding_type not in ('ollama', 'openai'):
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'default_embedding_type'")
+                row = cur.fetchone()
+                embedding_type = (row[0].strip().lower() if row and row[0] else 'openai')
+                logger.info(f"chat_folder: using system default embedding_type={embedding_type}")
+        except Exception as e:
+            logger.warning(f"chat_folder: failed reading system_config default, defaulting to openai: {e}")
+            embedding_type = 'openai'
+
+    # Get all PDFs in this folder
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, filename FROM pdfs WHERE folder_id = %s", (folder_id,))
+        pdf_rows = cur.fetchall()
+    
+    if not pdf_rows:
+        raise HTTPException(status_code=404, detail="No PDFs found in this folder")
+    
+    pdf_ids = [row[0] for row in pdf_rows]
+    pdf_names = {row[0]: row[1] for row in pdf_rows}
+    
+    logger.info(f"chat_folder: Found {len(pdf_ids)} PDFs in folder {folder_id}")
+
+    # Determine specific model names from config
+    ollama_model = None
+    openai_model = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_ollama_model'")
+            r = cur.fetchone()
+            ollama_model = r[0] if r and r[0] else None
+            cur.execute("SELECT value FROM system_config WHERE key = 'default_openai_model'")
+            r2 = cur.fetchone()
+            openai_model = r2[0] if r2 and r2[0] else None
+    except Exception:
+        ollama_model = ollama_model or None
+        openai_model = openai_model or None
+
+    openai_api_key = os.getenv("OPENAI_API_KEY", "")
+
+    # Generate query embedding
+    def _gen_ollama(q):
+        if ollama_model:
+            return get_ollama_embedding(q, model=ollama_model)
+        return get_ollama_embedding(q)
+
+    def _gen_openai(q):
+        if openai_model:
+            return get_openai_embedding(q, openai_api_key, model=openai_model)
+        return get_openai_embedding(q, openai_api_key)
+
+    query_embedding = None
+    if embedding_type == 'ollama':
+        try:
+            query_embedding = _gen_ollama(query)
+        except Exception as e:
+            logger.exception('chat_folder: Ollama embedding generation failed: %s', e)
+    elif embedding_type == 'openai':
+        try:
+            query_embedding = _gen_openai(query)
+        except Exception as e:
+            logger.exception('chat_folder: OpenAI embedding generation failed: %s', e)
+
+    if query_embedding is None:
+        raise HTTPException(status_code=500, detail='Failed to generate embeddings for the query.')
+
+    # Search across all PDFs in the folder and combine results
+    all_chunks = []
+    all_sources = []
+    
+    for pdf_id in pdf_ids:
+        try:
+            chunks, sources = search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3)
+            # Add PDF name to sources for identification
+            for src in sources:
+                src['pdf_id'] = pdf_id
+                src['pdf_name'] = pdf_names[pdf_id]
+            all_chunks.extend(chunks)
+            all_sources.extend(sources)
+        except Exception as e:
+            logger.warning(f"chat_folder: Error searching PDF {pdf_id}: {e}")
+            continue
+
+    if not all_chunks:
+        raise HTTPException(status_code=404, detail="No relevant content found in folder PDFs")
+
+    # Build context with source IDs
+    import re
+    context_with_sources = []
+    source_map = {}
+    
+    for idx, chunk in enumerate(all_chunks):
+        source_id = f"SOURCE_{idx + 1}"
+        source_map[source_id] = idx
+        
+        # Clean chunk
+        cleaned = chunk
+        cleaned = re.sub(r'\[PAGINA_\d+\]\n?', '', cleaned)
+        cleaned = re.sub(r'\[CHUNK_PARAGRAPHS_\d+-\d+\]', '', cleaned)
+        cleaned = cleaned.strip()
+        
+        # Add source identifier and PDF name
+        pdf_name = all_sources[idx].get('pdf_name', 'Unknown')
+        context_with_sources.append(f"[{source_id}] (Documento: {pdf_name})\n{cleaned}")
+    
+    context = "\n\n---\n\n".join(context_with_sources)
+
+    # Generate response
+    if embedding_type == "ollama":
+        ollama_model = "qwen3:4b"
+        prompt = f"""Eres un asistente experto en análisis de documentos. Estás analizando MÚLTIPLES documentos de una carpeta.
+
+REGLAS IMPERATIVAS DE CITACIÓN:
+1. CADA dato DEBE ir seguido de [SOURCE_N] inmediatamente
+2. MENCIONA el nombre del documento cuando cites información importante
+3. Formato: "La temperatura es 25°C [SOURCE_1] según DocumentoX.pdf [SOURCE_2]"
+4. Si hay información contradictoria entre documentos, mencionalo
+5. NUNCA respondas sin citar
+
+Pregunta: {query}
+
+Contexto de múltiples documentos:
+{context}"""
+        
+        ollama_response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": ollama_model, "prompt": prompt},
+            stream=True
+        )
+        fragments = []
+        for line in ollama_response.iter_lines():
+            if line:
+                try:
+                    data = line.decode("utf-8")
+                    obj = json.loads(data)
+                    if "response" in obj:
+                        fragments.append(obj["response"])
+                except Exception:
+                    continue
+        answer = "".join(fragments).strip()
+        if not answer:
+            answer = "No se pudo generar respuesta."
+    elif embedding_type == "openai":
+        openai_model = "gpt-4-turbo"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
+        
+        system_prompt = """Eres un asistente experto en análisis de múltiples documentos PDF.
+
+REGLAS IMPERATIVAS:
+1. CADA dato DEBE citarse con [SOURCE_N] inmediatamente después
+2. MENCIONA el nombre del documento cuando sea relevante
+3. Si hay información contradictoria, señálalo claramente
+4. Formato: "X es Y [SOURCE_1] (de DocumentoA.pdf)"
+5. NUNCA omitas citas
+
+Estás analizando múltiples documentos de una carpeta. Cada fuente incluye el nombre del documento."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Pregunta: {query}\n\nContexto:\n{context}"}
+        ]
+        
+        payload = {
+            "model": openai_model,
+            "messages": messages,
+            "max_tokens": 800,
+            "temperature": 0.3
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            answer = response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.exception("OpenAI request failed: %s", e)
+            answer = "Error al generar respuesta."
+
+    # Extract cited sources from answer
+    cited_refs = re.findall(r'\[SOURCE_(\d+)\]', answer)
+    cited_indices = [int(ref) - 1 for ref in cited_refs if int(ref) - 1 < len(all_sources)]
+    actual_sources = [all_sources[i] for i in cited_indices if i < len(all_sources)]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_sources = []
+    for src in actual_sources:
+        src_key = (src.get('pdf_id'), src.get('page'), src.get('preview', '')[:50])
+        if src_key not in seen:
+            seen.add(src_key)
+            unique_sources.append(src)
+    
+    actual_sources = unique_sources
+
+    # Save conversation (modify to support folder_id)
+    conversation_id = conversation_id or None
+    try:
+        if conversation_id:
+            # Verify conversation exists
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, user_id FROM conversations WHERE id = %s", (conversation_id,))
+                row = cur.fetchone()
+                if not row or row[1] != user['id']:
+                    conversation_id = None
+        
+        if not conversation_id:
+            # Create new conversation for folder
+            title = f"Carpeta: {query[:50]}" if len(query) > 50 else f"Carpeta: {query}"
+            with conn.cursor() as cur:
+                # Create conversation with folder_id instead of pdf_id
+                cur.execute(
+                    "INSERT INTO conversations (user_id, folder_id, title) VALUES (%s, %s, %s) RETURNING id",
+                    (user['id'], folder_id, title)
+                )
+                conversation_id = cur.fetchone()[0]
+                conn.commit()
+            logger.info("Created new folder conversation id=%d for folder_id=%d", conversation_id, folder_id)
+        
+        # Save user message
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content) VALUES (%s, %s, %s)",
+                (conversation_id, 'user', query)
+            )
+            conn.commit()
+        
+        # Save assistant response with sources
+        clean_answer = answer.strip()
+        sources_json = json.dumps(actual_sources) if actual_sources else None
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content, sources) VALUES (%s, %s, %s, %s)",
+                (conversation_id, 'assistant', clean_answer, sources_json)
+            )
+            conn.commit()
+        
+        # Update conversation timestamp
+        with conn.cursor() as cur:
+            cur.execute("UPDATE conversations SET updated_at = NOW() WHERE id = %s", (conversation_id,))
+            conn.commit()
+        
+        logger.info("Saved folder conversation messages to id=%d", conversation_id)
+    except Exception as e:
+        logger.exception("Failed to save folder conversation: %s", e)
+
+    # Generate suggested questions for folder context (only if requested)
+    suggested_questions = []
+    if include_suggestions and include_suggestions != '0':
+        try:
+            # Generate questions based on the folder context
+            if embedding_type == "ollama":
+                sugg_prompt = f"""Basándote en esta conversación sobre múltiples documentos, genera 3 preguntas de seguimiento breves y relevantes que el usuario podría hacer.
+
+Pregunta previa: {query}
+Respuesta: {answer[:500]}
+
+Genera exactamente 3 preguntas cortas (máximo 80 caracteres cada una) que exploren diferentes aspectos de los documentos en la carpeta. Devuelve solo las preguntas, una por línea, sin numeración."""
+                
+                try:
+                    sugg_resp = requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={"model": "qwen3:4b", "prompt": sugg_prompt},
+                        stream=True,
+                        timeout=15
+                    )
+                    sugg_fragments = []
+                    for line in sugg_resp.iter_lines():
+                        if line:
+                            try:
+                                obj = json.loads(line.decode("utf-8"))
+                                if "response" in obj:
+                                    sugg_fragments.append(obj["response"])
+                            except Exception:
+                                continue
+                    raw_suggestions = "".join(sugg_fragments).strip()
+                    suggested_questions = sanitize_suggested_questions_from_text(raw_suggestions, max_q=3)
+                except Exception as e:
+                    logger.warning("Failed to generate Ollama suggestions for folder: %s", e)
+            elif embedding_type == "openai":
+                sugg_prompt = f"""Basándote en esta conversación sobre múltiples documentos, genera 3 preguntas de seguimiento breves.
+
+Pregunta previa: {query}
+Respuesta: {answer[:500]}
+
+Genera 3 preguntas cortas (máximo 80 caracteres) que exploren diferentes aspectos de los documentos. Solo devuelve las preguntas, una por línea."""
+                
+                try:
+                    sugg_response = requests.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "gpt-3.5-turbo",
+                            "messages": [{"role": "user", "content": sugg_prompt}],
+                            "max_tokens": 200,
+                            "temperature": 0.7
+                        },
+                        timeout=15
+                    )
+                    if sugg_response.ok:
+                        raw_suggestions = sugg_response.json()["choices"][0]["message"]["content"]
+                        suggested_questions = sanitize_suggested_questions_from_text(raw_suggestions, max_q=3)
+                except Exception as e:
+                    logger.warning("Failed to generate OpenAI suggestions for folder: %s", e)
+        except Exception as e:
+            logger.warning("Suggestion generation failed for folder: %s", e)
+
+    return {
+        "response": clean_answer if 'clean_answer' in locals() else answer,
+        "sources": actual_sources,
+        "conversation_id": conversation_id,
+        "folder_id": folder_id,
+        "pdf_count": len(pdf_ids),
+        "pdf_names": list(pdf_names.values()),
+        "suggested_questions": suggested_questions
+    }
+
+
 # ============ CONVERSATION HISTORY ENDPOINTS ============
 
 @app.get("/conversations/")
@@ -2742,9 +3283,11 @@ async def get_conversations(user = Depends(get_current_user)):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT c.id, c.pdf_id, c.title, c.created_at, c.updated_at, p.filename as pdf_filename
+                SELECT c.id, c.pdf_id, c.folder_id, c.title, c.created_at, c.updated_at, 
+                       p.filename as pdf_filename, f.name as folder_name
                 FROM conversations c
                 LEFT JOIN pdfs p ON c.pdf_id = p.id
+                LEFT JOIN folders f ON c.folder_id = f.id
                 WHERE c.user_id = %s
                 ORDER BY c.updated_at DESC
             """, (user['id'],))
@@ -2755,10 +3298,13 @@ async def get_conversations(user = Depends(get_current_user)):
                 conversations.append({
                     'id': row[0],
                     'pdf_id': row[1],
-                    'title': row[2],
-                    'created_at': row[3].isoformat() if row[3] else None,
-                    'updated_at': row[4].isoformat() if row[4] else None,
-                    'pdf_filename': row[5]
+                    'folder_id': row[2],
+                    'title': row[3],
+                    'created_at': row[4].isoformat() if row[4] else None,
+                    'updated_at': row[5].isoformat() if row[5] else None,
+                    'pdf_filename': row[6],
+                    'folder_name': row[7],
+                    'type': 'folder' if row[2] else 'pdf'  # Indicar si es chat de carpeta o PDF
                 })
             
             return {"conversations": conversations}
@@ -3014,6 +3560,130 @@ async def suggest_questions(pdf_id: int):
     except Exception:
         suggested_questions = []
 
+    return {'suggested_questions': suggested_questions}
+
+
+@app.get('/folders/{folder_id}/suggest_questions')
+async def suggest_questions_folder(folder_id: int):
+    """Generate up to 3 suggested starter questions for a folder with multiple PDFs.
+    This endpoint is called when a user opens/selects a folder for chat.
+    """
+    # Get all PDFs in this folder
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, filename FROM pdfs WHERE folder_id = %s", (folder_id,))
+        pdf_rows = cur.fetchall()
+    
+    if not pdf_rows:
+        return {'suggested_questions': []}
+    
+    pdf_ids = [row[0] for row in pdf_rows]
+    pdf_names = [row[1] for row in pdf_rows]
+    
+    logger.info(f"suggest_questions_folder: Found {len(pdf_ids)} PDFs in folder {folder_id}")
+    
+    # Build context from all PDFs in folder (sample from each)
+    all_chunks = []
+    all_image_summaries = []
+    
+    for pdf_id in pdf_ids[:5]:  # Limit to first 5 PDFs to avoid too much context
+        with conn.cursor() as cur:
+            # Get image summaries
+            cur.execute("SELECT caption, page_number FROM pdf_images WHERE pdf_id = %s ORDER BY page_number LIMIT 3", (pdf_id,))
+            imgs = cur.fetchall()
+            for cap, pnum in imgs:
+                if cap and cap.strip():
+                    all_image_summaries.append(f"[{pdf_names[pdf_ids.index(pdf_id)]}] Pág {pnum}: {str(cap)[:150]}")
+            
+            # Get sample chunks
+            try:
+                cur.execute("SELECT chunk FROM pdf_chunks_openai WHERE pdf_id = %s ORDER BY id LIMIT 2", (pdf_id,))
+                all_chunks += [r[0] for r in cur.fetchall()]
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT chunk FROM pdf_chunks_ollama WHERE pdf_id = %s ORDER BY id LIMIT 2", (pdf_id,))
+                all_chunks += [r[0] for r in cur.fetchall()]
+            except Exception:
+                pass
+    
+    # Build context
+    context = ''
+    if all_image_summaries:
+        context += '[RESÚMENES DE IMÁGENES]\n' + '\n'.join(all_image_summaries[:10]) + '\n\n'
+    
+    # Clean and limit chunks
+    import re
+    cleaned_chunks = []
+    for chunk in all_chunks[:10]:
+        if chunk:
+            cleaned = re.sub(r'\[PAGINA_\d+\]\n?', '', chunk)
+            cleaned = re.sub(r'\[CHUNK_PARAGRAPHS_\d+-\d+\]', '', cleaned)
+            cleaned_chunks.append(cleaned.strip()[:300])
+    
+    context += '\n'.join(cleaned_chunks)
+    
+    # Create prompt mentioning multiple documents
+    followup_prompt = (
+        f"Esta carpeta contiene {len(pdf_names)} documentos: {', '.join(pdf_names[:3])}{'...' if len(pdf_names) > 3 else ''}.\n\n"
+        f"Basándote en los siguientes extractos de estos documentos, genera 3 preguntas exploratorias concisas en español "
+        f"que un usuario podría hacer para analizar el contenido de esta carpeta de documentos.\n\n"
+        f"Extractos:\n{context[:2000]}\n\n"
+        f"Devuelve únicamente un JSON array con las 3 preguntas, ejemplo: [\"¿Pregunta 1?\", \"¿Pregunta 2?\", \"¿Pregunta 3?\"]"
+    )
+    
+    txt = ''
+    openai_api_key = os.getenv('OPENAI_API_KEY', '')
+    
+    # Try providers (prefer OpenAI for better multi-doc understanding, then Ollama)
+    provider_pref = ['openai', 'ollama'] if openai_api_key else ['ollama']
+    
+    for provider in provider_pref:
+        if provider == 'ollama':
+            try:
+                logger.info('suggest_questions_folder: trying Ollama for folder_id=%s', folder_id)
+                payload = {
+                    'model': 'qwen3:4b',
+                    'messages': [{'role': 'user', 'content': followup_prompt}],
+                    'stream': False
+                }
+                try:
+                    resp = requests.post('http://localhost:11434/api/chat', json=payload, timeout=10)
+                    if resp.ok:
+                        jr = resp.json()
+                        txt = (jr.get('message', {}) or {}).get('content') or jr.get('response') or ''
+                except Exception:
+                    resp = requests.post('http://localhost:11434/api/generate', json={'model': 'qwen3:4b', 'prompt': followup_prompt, 'stream': False}, timeout=10)
+                    if resp.ok:
+                        jr = resp.json()
+                        txt = jr.get('response') or jr.get('text') or ''
+            except Exception as e:
+                logger.warning('suggest_questions_folder: Ollama failed: %s', e)
+        else:
+            try:
+                logger.info('suggest_questions_folder: trying OpenAI for folder_id=%s', folder_id)
+                url = 'https://api.openai.com/v1/chat/completions'
+                headers = {'Authorization': f'Bearer {openai_api_key}', 'Content-Type': 'application/json'}
+                payload = {
+                    'model': 'gpt-4o-mini',
+                    'messages': [{'role': 'user', 'content': followup_prompt}],
+                    'max_tokens': 200
+                }
+                r2 = requests.post(url, headers=headers, json=payload, timeout=10)
+                if r2.ok:
+                    txt = r2.json().get('choices', [{}])[0].get('message', {}).get('content', '')
+            except Exception as e:
+                logger.warning('suggest_questions_folder: OpenAI failed: %s', e)
+        
+        if txt:
+            logger.info('suggest_questions_folder: generated suggestions with %s', provider)
+            break
+    
+    # Parse & sanitize
+    try:
+        suggested_questions = sanitize_suggested_questions_from_text(txt, max_q=3)
+    except Exception:
+        suggested_questions = []
+    
     return {'suggested_questions': suggested_questions}
 
 
