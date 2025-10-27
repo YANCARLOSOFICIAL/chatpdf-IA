@@ -1035,9 +1035,6 @@ export default {
         console.warn('Error configurando visor PDF:', e);
       }
       
-      // Cargar conversaciones del nuevo documento
-      this.loadConversations();
-      
       if (this.isMobile) {
         this.sidebarOpen = false;
       }
@@ -1591,6 +1588,17 @@ export default {
       this.messageInput = question;
       await this.$nextTick();
       this.sendMessage();
+    },
+
+    // Guardar la conversación actual (cuando se cambia de documento o se cierra)
+    async saveCurrentConversation() {
+      // Si hay mensajes y documento actual, la conversación ya se guardó automáticamente
+      // en cada respuesta. Este método es un safety check.
+      if (!this.currentDocument || !this.messages || this.messages.length === 0) {
+        return;
+      }
+      // La conversación ya fue guardada durante sendMessage
+      console.debug('Conversación guardada automáticamente');
     }
   }
 };

@@ -529,23 +529,92 @@ def migrate_metadata_to_db():
 
 migrate_metadata_to_db()
 
+def create_smart_chunks(text):
+    """
+    Crear chunks inteligentes dividiendo por párrafos/secciones en lugar de caracteres.
+    Cada chunk conserva información de contexto (página, número de párrafo).
+    Esto permite rastrear exactamente dónde en el PDF vino cada chunk.
+    """
+    import re
+    
+    chunks = []
+    current_pos = 0
+    chunk_size = 0
+    max_chunk_size = 1500  # Chunks más grandes para mantener contexto
+    
+    # Dividir por líneas en blanco (párrafos)
+    paragraphs = re.split(r'\n\s*\n', text)
+    
+    current_chunk = []
+    chunk_paragraphs = []  # Rastrear # de párrafos en este chunk
+    para_counter = 0
+    
+    for para_idx, paragraph in enumerate(paragraphs):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        
+        # Detectar página del párrafo
+        page_match = re.search(r'\[PAGINA_(\d+)\]', paragraph)
+        page_num = page_match.group(1) if page_match else None
+        
+        para_counter += 1
+        para_size = len(paragraph)
+        
+        # Si agregar este párrafo excede el límite, guardar chunk actual
+        if current_chunk and chunk_size + para_size > max_chunk_size:
+            chunk_text = '\n\n'.join(current_chunk)
+            # Agregar metadata al chunk
+            chunk_with_meta = f"[CHUNK_PARAGRAPHS_{para_counter-len(chunk_paragraphs)}-{para_counter}]\n{chunk_text}"
+            chunks.append(chunk_with_meta)
+            current_chunk = []
+            chunk_size = 0
+        
+        # Agregar párrafo al chunk actual
+        current_chunk.append(paragraph)
+        chunk_size += para_size + 2  # +2 para "\n\n"
+        chunk_paragraphs.append(para_idx)
+    
+    # Agregar último chunk
+    if current_chunk:
+        chunk_text = '\n\n'.join(current_chunk)
+        chunk_with_meta = f"[CHUNK_PARAGRAPHS_{para_counter-len(chunk_paragraphs)+1}-{para_counter}]\n{chunk_text}"
+        chunks.append(chunk_with_meta)
+    
+    # Fallback: si no hay párrafos (texto muy corto), usar chunking simple
+    if not chunks:
+        chunks = [text[i:i+1500] for i in range(0, len(text), 1500)]
+    
+    logger.info(f"Created {len(chunks)} smart chunks from text")
+    return chunks
+
 def extract_text_from_pdf(file_path):
     """
-    Extract text from PDF. Try PyPDF2 first; if extracted text is very small,
+    Extract text from PDF with PAGE MARKERS. Try PyPDF2 first; if extracted text is very small,
     fall back to OCR using pdf2image + pytesseract to handle image-based PDFs
     (scanned documents, math expressions embedded as images, etc.). We also
     attempt table extraction as a future enhancement (Camelot/Tabula), but
     that requires system dependencies and is optional.
+    
+    IMPORTANTE: Agrega marcadores de página "[PAGINA_N]" en el texto para tracking posterior.
     """
-    text = ""
-    # Primary extraction using PyPDF2
+    text_parts = []
+    current_page = 1
+    
+    # Primary extraction using PyPDF2 con información de página
     try:
         with open(file_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text += page.extract_text() or ""
-    except Exception:
-        text = ""
+            for page_num, page in enumerate(reader.pages, start=1):
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    # Agregar marcador de página al inicio
+                    text_parts.append(f"[PAGINA_{page_num}]\n{page_text}")
+                    current_page = page_num
+    except Exception as e:
+        logger.debug(f"PyPDF2 extraction failed: {e}")
+
+    text = "\n\n".join(text_parts) if text_parts else ""
 
     # If little or no text extracted, try OCR on each page image
     if not text or len(text.strip()) < 50:
@@ -554,16 +623,26 @@ def extract_text_from_pdf(file_path):
             import pytesseract
             images = convert_from_path(file_path, dpi=200)
             ocr_text_parts = []
-            for img in images:
+            for page_num, img in enumerate(images, start=1):
                 try:
-                    ocr_text_parts.append(pytesseract.image_to_string(img, lang='eng'))
+                    page_ocr_text = pytesseract.image_to_string(img, lang='eng')
                 except Exception:
                     # try without specifying lang
-                    ocr_text_parts.append(pytesseract.image_to_string(img))
-            ocr_text = "\n".join(ocr_text_parts)
+                    try:
+                        page_ocr_text = pytesseract.image_to_string(img)
+                    except Exception:
+                        page_ocr_text = ""
+                
+                if page_ocr_text.strip():
+                    # Agregar marcador de página
+                    ocr_text_parts.append(f"[PAGINA_{page_num}]\n{page_ocr_text}")
+            
+            ocr_text = "\n\n".join(ocr_text_parts) if ocr_text_parts else ""
             if ocr_text and len(ocr_text.strip()) > len(text):
                 text = ocr_text
-        except Exception:
+                logger.info(f"OCR extraction used, total pages: {len(ocr_text_parts)}")
+        except Exception as e:
+            logger.debug(f"OCR extraction failed: {e}")
             # pdf2image/pytesseract not available or failed — keep whatever text we have
             pass
 
@@ -571,6 +650,7 @@ def extract_text_from_pdf(file_path):
     # to parse tables into text (CSV/TSV) and append to `text`. Camelot needs
     # system dependencies (ghostscript, opencv) so we leave it as optional.
 
+    logger.info(f"PDF text extraction complete. Total length: {len(text)} chars, page markers included")
     return text
 
 def get_ollama_embedding(text, model="embeddinggemma:latest"):
@@ -1173,84 +1253,138 @@ def create_pdf_entry_with_hash(filename, embedding_type, file_hash=None, user_id
 
 def map_chunk_to_bbox(pdf_path, chunk_text, inserted_chunk_id, chunk_table, pdf_id):
     """Attempt to map a chunk of text back to a page bbox using pdfplumber.
-    Heuristic: for each page, extract words with bbox, join their texts and find the
-    first occurrence of a short snippet from the chunk; use the matched words' boxes
-    to compute a bounding box and save via save_chunk_span.
+    Usa búsqueda exacta primero, luego fuzzy matching si es necesario.
+    Guarda en pdf_chunk_spans para futuras búsquedas.
     """
     try:
         import pdfplumber
-    except Exception:
+    except Exception as e:
+        logger.warning(f"map_chunk_to_bbox: pdfplumber not available: {e}")
         return None
 
     try:
-        snippet = (chunk_text or '')[:120].strip()
-        if not snippet:
+        # IMPORTANTE: Limpiar el chunk de marcadores internos ANTES de buscar
+        import re
+        cleaned_chunk = chunk_text or ""
+        cleaned_chunk = re.sub(r'\[PAGINA_\d+\]\n?', '', cleaned_chunk)
+        cleaned_chunk = re.sub(r'\[CHUNK_PARAGRAPHS_\d+-\d+\]', '', cleaned_chunk)
+        cleaned_chunk = re.sub(r'\s+', ' ', cleaned_chunk).strip()
+        
+        # Extraer múltiples snippets de diferentes longitudes para búsqueda robusta
+        # PRIORITARIO: Buscar el chunk COMPLETO primero, luego fragmentos
+        snippets = []
+        # Snippet muy largo (primeros 300 chars - preferimos matches más específicas)
+        if len(cleaned_chunk) > 200:
+            snippets.append((cleaned_chunk[:300].strip(), 'full'))
+        # Snippet largo (primeros 150 chars)
+        if len(cleaned_chunk) > 100:
+            snippets.append((cleaned_chunk[:150].strip(), 'long'))
+        # Snippet mediano (primeros 80 chars)
+        if len(cleaned_chunk) > 50:
+            snippets.append((cleaned_chunk[:80].strip(), 'medium'))
+        # Snippet corto (primeros 40 chars)
+        if len(cleaned_chunk) > 20:
+            snippets.append((cleaned_chunk[:40].strip(), 'short'))
+        
+        if not snippets:
+            logger.warning(f"map_chunk_to_bbox: No snippets generated for chunk_id={inserted_chunk_id} (empty or too short): {len(cleaned_chunk)} chars")
             return None
 
+        logger.info(f"map_chunk_to_bbox: Attempting to find {len(snippets)} snippets for chunk_id={inserted_chunk_id}")
+        logger.info(f"  Cleaned chunk (first 150): {cleaned_chunk[:150]}")
+        logger.info(f"  Snippets to search: {[s[0][:50] for s in snippets]}")
+
         with pdfplumber.open(pdf_path) as doc:
+            logger.info(f"map_chunk_to_bbox: PDF opened, {len(doc.pages)} pages")
             for pnum, page in enumerate(doc.pages, start=1):
                 try:
                     words = page.extract_words(use_text_flow=True)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"  Page {pnum}: extract_words failed: {e}")
                     words = []
+                
+                # Si no hay palabras, intentar extracción de texto plano
                 if not words:
-                    # fallback: try page.extract_text()
                     try:
-                        pg_text = page.extract_text() or ''
-                    except Exception:
+                        pg_text = (page.extract_text() or '').strip()
+                    except Exception as e:
+                        logger.debug(f"  Page {pnum}: extract_text failed: {e}")
                         pg_text = ''
-                    if snippet in pg_text:
-                        # approximate full-page bbox
-                        w = page.width
-                        h = page.height
-                        save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, 0.0, 0.0, w, h)
-                        return {'page': pnum, 'x': 0.0, 'y': 0.0, 'w': w, 'h': h}
+                    
+                    # Búsqueda en texto plano
+                    for snippet, snippet_type in snippets:
+                        if snippet.lower() in pg_text.lower():
+                            # Aproximar bbox a página completa
+                            w = page.width
+                            h = page.height
+                            save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, 0.0, 0.0, w, h)
+                            logger.info(f"map_chunk_to_bbox: Found chunk via text extract on page {pnum}")
+                            return {'page': pnum, 'x': 0.0, 'y': 0.0, 'w': w, 'h': h}
                     continue
 
-                # Build a list of word texts and their boxes
+                # Construir texto unido de palabras
                 texts = [w.get('text', '') for w in words]
                 joined = ' '.join(texts)
-                idx = joined.find(snippet)
-                if idx == -1:
-                    # try case-insensitive
-                    idx = joined.lower().find(snippet.lower())
-                if idx != -1:
-                    # find word indices roughly covering the match
-                    # We'll search for first and last words matching by matching characters cumulatively
-                    char_count = 0
-                    start_i = None
-                    end_i = None
-                    for i, t in enumerate(texts):
-                        prev = char_count
-                        char_count += len(t) + 1
-                        if start_i is None and prev <= idx < char_count:
-                            start_i = i
-                        if start_i is not None and char_count >= idx + len(snippet):
-                            end_i = i
-                            break
-                    if start_i is None:
-                        start_i = 0
-                    if end_i is None:
-                        end_i = min(len(texts)-1, start_i+5)
-
-                    # aggregate boxes
-                    xs = [float(words[i].get('x0', 0)) for i in range(start_i, end_i+1)]
-                    ys = [float(words[i].get('top', 0)) for i in range(start_i, end_i+1)]
-                    x1s = [float(words[i].get('x1', 0)) for i in range(start_i, end_i+1)]
-                    y1s = [float(words[i].get('bottom', 0)) for i in range(start_i, end_i+1)]
-                    if not xs:
-                        continue
-                    x_min = min(xs)
-                    y_min = min(ys)
-                    x_max = max(x1s)
-                    y_max = max(y1s)
-                    width = max(0.0, x_max - x_min)
-                    height = max(0.0, y_max - y_min)
-                    save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, x_min, y_min, width, height)
-                    return {'page': pnum, 'x': x_min, 'y': y_min, 'w': width, 'h': height}
+                
+                # Intentar búsqueda con cada snippet (de mayor a menor especificidad)
+                for snippet, snippet_type in snippets:
+                    # Búsqueda exacta primero
+                    idx = joined.find(snippet)
+                    if idx == -1:
+                        # Búsqueda case-insensitive
+                        idx = joined.lower().find(snippet.lower())
+                    
+                    if idx != -1:
+                        logger.info(f"map_chunk_to_bbox: Found {snippet_type} snippet on page {pnum}, idx={idx}")
+                        # Encontró coincidencia - mapear palabras
+                        char_count = 0
+                        start_i = None
+                        end_i = None
+                        
+                        for i, t in enumerate(texts):
+                            prev = char_count
+                            char_count += len(t) + 1
+                            if start_i is None and prev <= idx < char_count:
+                                start_i = i
+                            if start_i is not None and char_count >= idx + len(snippet):
+                                end_i = i
+                                break
+                        
+                        if start_i is None:
+                            start_i = 0
+                        if end_i is None:
+                            end_i = min(len(texts)-1, start_i+10)
+                        
+                        # Agregar coordenadas de las palabras encontradas
+                        try:
+                            xs = [float(words[i].get('x0', 0)) for i in range(start_i, end_i+1) if i < len(words)]
+                            ys = [float(words[i].get('top', 0)) for i in range(start_i, end_i+1) if i < len(words)]
+                            x1s = [float(words[i].get('x1', 0)) for i in range(start_i, end_i+1) if i < len(words)]
+                            y1s = [float(words[i].get('bottom', 0)) for i in range(start_i, end_i+1) if i < len(words)]
+                            
+                            if not xs:
+                                logger.debug(f"  Page {pnum}: No coordinates found for words {start_i}-{end_i}")
+                                continue
+                            
+                            x_min = min(xs)
+                            y_min = min(ys)
+                            x_max = max(x1s)
+                            y_max = max(y1s)
+                            width = max(0.0, x_max - x_min)
+                            height = max(0.0, y_max - y_min)
+                            
+                            logger.info(f"map_chunk_to_bbox: Coordinates found: page={pnum}, x={x_min:.1f}, y={y_min:.1f}, w={width:.1f}, h={height:.1f}")
+                            save_chunk_span(chunk_table, inserted_chunk_id, pdf_id, pnum, x_min, y_min, width, height)
+                            logger.info(f"map_chunk_to_bbox: Mapped chunk on page {pnum} ({snippet_type} match)")
+                            return {'page': pnum, 'x': x_min, 'y': y_min, 'w': width, 'h': height}
+                        except Exception as e:
+                            logger.debug(f"Error computing bbox on page {pnum}: {e}")
+                            continue
 
     except Exception as e:
         logger.exception('map_chunk_to_bbox failed: %s', e)
+    
+    logger.warning(f"map_chunk_to_bbox: No bbox found for chunk_id={inserted_chunk_id} (first 100 chars): {chunk_text[:100]}")
     return None
 
 
@@ -1411,6 +1545,7 @@ def get_pdf_embedding_type(pdf_id):
 def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
     """Return both chunks and metadata for provenance/evidence tracking.
     Returns: (chunks_list, sources_list) where sources contain id, chunk text, page hints.
+    MEJORADO: Extrae información exacta de párrafo/sección.
     """
     table_name = "pdf_chunks_ollama" if embedding_type == "ollama" else "pdf_chunks_openai"
     with conn.cursor() as cur:
@@ -1426,38 +1561,106 @@ def search_similar_chunks(pdf_id, query_embedding, embedding_type, top_k=3):
     
     chunks = []
     sources = []
+    import re
+    
     for chunk_id, chunk_text in results:
         chunks.append(chunk_text)
-        # Try to infer page number from chunk text (look for "Página N" markers)
-        import re
-        page_match = re.search(r'P[áa]gina\s+(\d+)', chunk_text or '', re.IGNORECASE)
-        page_num = int(page_match.group(1)) if page_match else None
         
-        # Extract first 200 chars as preview
-        preview = (chunk_text or '')[:200].strip()
-        if len(chunk_text or '') > 200:
+        # MEJORADO: Extraer información precisa del chunk
+        # 1. Detectar número de párrafo si existe
+        para_match = re.search(r'\[CHUNK_PARAGRAPHS_(\d+)-(\d+)\]', chunk_text or '')
+        para_start = para_match.group(1) if para_match else None
+        para_end = para_match.group(2) if para_match else None
+        
+        # 2. Remover marcadores y limpiar texto
+        preview_text = chunk_text or ""
+        preview_text = re.sub(r'\[CHUNK_PARAGRAPHS_\d+-\d+\]', '', preview_text)
+        preview_text = re.sub(r'\[PAGINA_\d+\]\n?', '', preview_text)
+        preview_text = re.sub(r'\s+', ' ', preview_text).strip()
+        
+        # 3. Extraer primeras 2-3 oraciones para preview
+        sentences = re.split(r'(?<=[.!?])\s+', preview_text)
+        preview_parts = []
+        char_count = 0
+        for sentence in sentences:
+            if char_count + len(sentence) > 280:
+                break
+            preview_parts.append(sentence)
+            char_count += len(sentence) + 1
+        
+        preview = ' '.join(preview_parts).strip()
+        if len(preview) == 0:
+            preview = preview_text[:200].strip()
+        
+        if len(preview_text) > len(preview):
             preview += '...'
         
-        # Try to fetch stored span (bounding box) if available
+        # 4. Agregar información de párrafo si existe
+        location_info = ""
+        if para_start and para_end:
+            if para_start == para_end:
+                location_info = f"Párrafo {para_start}"
+            else:
+                location_info = f"Párrafos {para_start}-{para_end}"
+        
+        # PRIORIDAD 1: Buscar en pdf_chunk_spans (datos guardados durante la carga del PDF)
+        page_num = None
         span = None
         try:
             with conn.cursor() as cur2:
-                cur2.execute("SELECT page_number, x, y, width, height FROM pdf_chunk_spans WHERE chunk_id = %s AND pdf_id = %s ORDER BY id LIMIT 1", (chunk_id, pdf_id))
+                cur2.execute(
+                    "SELECT page_number, x, y, width, height FROM pdf_chunk_spans WHERE chunk_id = %s AND pdf_id = %s ORDER BY id LIMIT 1", 
+                    (chunk_id, pdf_id)
+                )
                 rspan = cur2.fetchone()
                 if rspan:
+                    page_num = int(rspan[0])
                     span = {'page': rspan[0], 'x': float(rspan[1]), 'y': float(rspan[2]), 'w': float(rspan[3]), 'h': float(rspan[4])}
-        except Exception:
-            span = None
-
+        except Exception as e:
+            logger.debug(f"Error fetching chunk span for chunk_id={chunk_id}: {e}")
+        
+        # PRIORIDAD 2: Buscar marcador [PAGINA_N] en el chunk
+        if page_num is None:
+            page_match = re.search(r'\[PAGINA_(\d+)\]', chunk_text or '')
+            if page_match:
+                page_num = int(page_match.group(1))
+        
+        # PRIORIDAD 3: Regex fallback
+        if page_num is None:
+            patterns = [
+                r'P[áa]gina\s+(\d+)',
+                r'Page\s+(\d+)',
+                r'pág\.\s*(\d+)',
+                r'p\.\s*(\d+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, chunk_text or '', re.IGNORECASE)
+                if match:
+                    page_num = int(match.group(1))
+                    break
+        
+        # Construir preview con ubicación exacta
+        if location_info:
+            full_preview = f"[Pág. {page_num}, {location_info}]\n{preview}" if page_num else f"[{location_info}]\n{preview}"
+        else:
+            full_preview = preview
+        
         src = {
             'chunk_id': chunk_id,
             'page': page_num,
-            'preview': preview,
+            'preview': full_preview,
+            'location': location_info,  # Nueva: información de párrafo
             'pdf_id': pdf_id
         }
         if span:
             src['coords'] = span
         sources.append(src)
+    
+    # OPTIMIZACIÓN: Reordenar sources para que los que tengan coords aparezcan primero
+    # Esto mejora la probabilidad de que el LLM cite una source con coordenadas
+    sources_with_coords = [s for s in sources if s.get('coords')]
+    sources_without_coords = [s for s in sources if not s.get('coords')]
+    sources = sources_with_coords + sources_without_coords
     
     return chunks, sources
 
@@ -1633,8 +1836,9 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(Non
         # Best-effort cleanup; do not fail the upload if removal fails
         logger.warning("Failed to remove temporary upload file: %s", tmp_path)
 
-    # Dividir texto en chunks simples
-    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+    # MEJORADO: Dividir texto en chunks por párrafos/secciones, no por caracteres
+    # Esto permite rastrear exactamente de dónde vino cada chunk
+    chunks = create_smart_chunks(text)
 
     # Get specific model from config if using ollama
     ollama_model = "embeddinggemma:latest"
@@ -1670,8 +1874,8 @@ async def upload_pdf(pdf: UploadFile = File(...), embedding_type: str = Form(Non
             pdf_path = str(Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf")
             if inserted_chunk_id and os.path.exists(pdf_path):
                 map_chunk_to_bbox(pdf_path, chunk, inserted_chunk_id, 'pdf_chunks_ollama' if embedding_type=='ollama' else 'pdf_chunks_openai', pdf_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception(f"Error in map_chunk_to_bbox call: {e}")
 
     return {"filename": pdf.filename, "embedding_type": embedding_type, "pdf_id": pdf_id}
 
@@ -1873,8 +2077,8 @@ async def upload_pdfs(pdfs: list[UploadFile] = File(...), embedding_type: str = 
                     pdf_path = str(Path(__file__).resolve().parent / 'uploads' / 'pdfs' / f"{pdf_id}.pdf")
                     if inserted_chunk_id and os.path.exists(pdf_path):
                         map_chunk_to_bbox(pdf_path, chunk, inserted_chunk_id, 'pdf_chunks_ollama' if embedding_type=='ollama' else 'pdf_chunks_openai', pdf_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception(f"Error in map_chunk_to_bbox call (reindex): {e}")
 
             results.append({'filename': pdf.filename, 'status': 'uploaded', 'pdf_id': pdf_id})
         except HTTPException as he:
@@ -2006,7 +2210,26 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
         logger.exception("Error searching similar chunks for pdf_id=%s", pdf_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving context for PDF: {e}")
 
-    context = "\n".join(chunks)
+    # NUEVO: Construir contexto con identificadores únicos para citación
+    # Cada chunk obtiene un ID [SOURCE_N] que el LLM puede usar para citar
+    import re
+    context_with_sources = []
+    source_map = {}  # Mapear ID de SOURCE a índice en sources list
+    
+    for idx, chunk in enumerate(chunks):
+        source_id = f"SOURCE_{idx + 1}"
+        source_map[source_id] = idx
+        
+        # Remover marcadores internos
+        cleaned = chunk
+        cleaned = re.sub(r'\[PAGINA_\d+\]\n?', '', cleaned)
+        cleaned = re.sub(r'\[CHUNK_PARAGRAPHS_\d+-\d+\]', '', cleaned)
+        cleaned = cleaned.strip()
+        
+        # Agregar identificador de fuente al inicio del chunk
+        context_with_sources.append(f"[{source_id}]\n{cleaned}")
+    
+    context = "\n\n---\n\n".join(context_with_sources)
 
     # Metadata to return so frontend can show whether vision was used
     used_vlm_enhanced = False
@@ -2126,18 +2349,24 @@ async def chat(query: str = Form(...), pdf_id: int = Form(...), embedding_type: 
     if embedding_type == "ollama":
         # Usar Qwen (disponible en Ollama) para generar respuesta
         ollama_model = "qwen3:4b"  # modelo conversacional instalado en Ollama
-        prompt = f"""Responde en lenguaje natural a la pregunta del usuario usando el contexto extraído del documento.
+        prompt = f"""Eres un asistente experto en análisis de documentos PDF. Tu tarea es responder preguntas citando OBLIGATORIAMENTE las fuentes.
 
-El contexto puede incluir:
-- Texto extraído directamente del PDF
-- Texto extraído vía OCR de imágenes (marcado con [OCR_EXTRACTED_TEXT])
-- Descripciones visuales de imágenes generadas por IA (marcado con [IMAGE_CAPTIONS])
+REGLAS IMPERATIVAS DE CITACIÓN (NO PUEDES OMITIRLAS):
+1. CADA vez que mencionas un dato, hecho o información, DEBES citar inmediatamente [SOURCE_N]
+2. Formato EXACTO: "La temperatura es 25°C [SOURCE_1]" o "El proceso incluye 3 pasos [SOURCE_2]"
+3. Si usas información de múltiples fuentes: "El resultado es X [SOURCE_1] y también Y [SOURCE_3]"
+4. NUNCA respondas sin citar. Si mencionas algo, cita de dónde lo sacaste
+5. Las citas van INMEDIATAMENTE después de la información, NO al final del párrafo
 
-Si la pregunta es sobre imágenes, diagramas, gráficos o elementos visuales, usa las descripciones disponibles en [IMAGE_CAPTIONS] para responder de manera precisa y detallada.
+FORMATO DE RESPUESTA:
+- Responde de forma DIRECTA y CONCISA
+- NO hagas introducciones largas
+- Cita CADA dato con [SOURCE_N] justo después del dato
+- Si no estás seguro de qué fuente usar, usa [SOURCE_1]
 
 Pregunta: {query}
 
-Contexto del documento:
+Contexto con referencias (cada bloque empieza con [SOURCE_N]):
 {context}"""
         ollama_response = requests.post(
             "http://localhost:11434/api/generate",
@@ -2168,17 +2397,35 @@ Contexto del documento:
             headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
             
             # Build messages array with text + images
-            system_prompt = """Eres un asistente experto que responde preguntas sobre documentos PDF con contenido multimodal.
+            system_prompt = """Eres un asistente experto en análisis de documentos PDF.
+
+REGLAS IMPERATIVAS DE CITACIÓN (OBLIGATORIAS - NO PUEDES OMITIRLAS):
+1. CADA dato, hecho o información DEBE ir seguido INMEDIATAMENTE de [SOURCE_N]
+2. Formato EXACTO obligatorio:
+   ✓ CORRECTO: "La temperatura es 25°C [SOURCE_1]"
+   ✓ CORRECTO: "El costo es $100 [SOURCE_1] y el plazo es 30 días [SOURCE_2]"
+   ✗ INCORRECTO: "Según el documento, la temperatura es 25°C" (sin citar)
+   ✗ INCORRECTO: "La temperatura es 25°C. [SOURCE_1]" (punto antes de cita)
+3. Las citas van INMEDIATAMENTE después del dato (sin punto antes)
+4. Si usas información de múltiples fuentes, cita cada una donde corresponde
+5. NUNCA respondas sin citar. Si dudas, usa [SOURCE_1]
+6. NO uses frases genéricas como "según el documento" - cita la fuente específica
+
+FORMATO DE RESPUESTA:
+- Responde DIRECTAMENTE al punto sin rodeos
+- NO hagas introducciones innecesarias
+- Cada información → cita inmediata con [SOURCE_N]
+- Si preguntan "¿cuál es X?", responde "X es Y [SOURCE_N]"
 
 Tienes acceso a:
-1. El texto extraído del documento (incluye OCR si es necesario)
-2. Las imágenes originales del documento
+1. Texto extraído marcado con [SOURCE_N] al inicio de cada bloque
+2. Imágenes del documento para análisis visual
 
-Analiza tanto el texto como las imágenes para proporcionar respuestas precisas y detalladas. Cuando veas gráficos, diagramas, tablas o cualquier elemento visual, descríbelos específicamente y úsalos para responder la pregunta del usuario."""
+Usa ambos para responder con PRECISIÓN y CITACIONES OBLIGATORIAS."""
             
             # Create user message with text context
             user_content = [
-                {"type": "text", "text": f"Pregunta: {query}\n\nContexto del documento:\n{context}"}
+                {"type": "text", "text": f"Pregunta: {query}\n\nContexto del documento con referencias:\n{context}"}
             ]
             
             # Add images (from selected_images which respects page refs)
@@ -2235,17 +2482,27 @@ Analiza tanto el texto como las imágenes para proporcionar respuestas precisas 
             openai_model = "gpt-4-turbo"  # Cambia por el modelo que prefieras
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {openai_api_key}", "Content-Type": "application/json"}
-            system_prompt = """Eres un asistente que responde preguntas sobre documentos PDF.
+            system_prompt = """Eres un asistente experto en análisis de documentos PDF.
 
-El contexto que recibes puede incluir:
-- Texto extraído directamente del PDF
-- Texto extraído vía OCR de imágenes (marcado con [OCR_EXTRACTED_TEXT])
-- Descripciones visuales detalladas de imágenes, diagramas y gráficos generadas por IA de visión (marcado con [IMAGE_CAPTIONS])
+REGLAS IMPERATIVAS DE CITACIÓN (OBLIGATORIAS):
+1. CADA dato DEBE ir seguido INMEDIATAMENTE de [SOURCE_N]
+2. Formato EXACTO:
+   ✓ "El valor es 42 [SOURCE_1]"
+   ✓ "El proceso tiene 5 pasos [SOURCE_2] y dura 3 días [SOURCE_1]"
+   ✗ NUNCA sin citar: "El valor es 42" (incorrecto)
+3. Cita INMEDIATAMENTE después del dato (sin punto antes)
+4. Si usas múltiples fuentes, cita cada una en su lugar
+5. NUNCA omitas citas. Si dudas, usa [SOURCE_1]
 
-Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualquier elemento visual del documento, usa las descripciones disponibles en las secciones [IMAGE_CAPTIONS] para proporcionar respuestas precisas y detalladas. No digas que no puedes ver las imágenes; en su lugar, usa las descripciones visuales proporcionadas en el contexto."""
+FORMATO:
+- Responde DIRECTO al punto
+- NO introducciones largas
+- Cada dato → [SOURCE_N] inmediato
+
+El contexto incluye texto extraído marcado con [SOURCE_N] al inicio de cada bloque."""
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Pregunta: {query}\n\nContexto del documento:\n{context}"}
+                {"role": "user", "content": f"Pregunta: {query}\n\nContexto del documento con referencias:\n{context}"}
             ]
             payload = {"model": openai_model, "messages": messages, "max_tokens": 256}
             
@@ -2360,13 +2617,100 @@ Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualq
         
         # Save assistant message with sources
         import json
-        sources_json = json.dumps(sources) if sources else None
-        page_number = sources[0].get('page') if sources and len(sources) > 0 and 'page' in sources[0] else None
+        import re
+        
+        # NUEVO: Parsear qué fuentes fueron realmente citadas en la respuesta
+        cited_source_ids = set()
+        source_citations = re.findall(r'\[SOURCE_(\d+)\]', answer)
+        logger.info(f"=== SOURCE PARSING DEBUG ===")
+        logger.info(f"RAW ANSWER: {answer[:800]}")
+        logger.info(f"SOURCE CITATIONS FOUND: {source_citations}")
+        logger.info(f"TOTAL SOURCES AVAILABLE: {len(sources)}")
+        
+        for src_idx, src in enumerate(sources):
+            logger.info(f"  SOURCE[{src_idx}]: page={src.get('page')}, has_coords={bool(src.get('coords'))}, preview={src.get('preview', '')[:80]}")
+        
+        # Parsear las citas encontradas
+        for source_num in source_citations:
+            source_idx = int(source_num) - 1
+            if 0 <= source_idx < len(sources):
+                cited_source_ids.add(source_idx)
+                logger.info(f"VALID CITATION: [SOURCE_{source_num}] -> sources[{source_idx}]")
+            else:
+                logger.warning(f"INVALID CITATION: [SOURCE_{source_num}] out of range (max={len(sources)})")
+        
+        # FALLBACK MEJORADO: Si no hay citaciones válidas
+        if not cited_source_ids and sources:
+            logger.warning(f"NO VALID CITATIONS FOUND - Using intelligent fallback")
+            # Estrategia 1: Usar la fuente con mejor score (primera)
+            cited_source_ids.add(0)
+            # Estrategia 2: Si hay coordenadas, usar también esa
+            for idx, src in enumerate(sources[:3]):  # Revisar top 3
+                if src.get('coords'):
+                    cited_source_ids.add(idx)
+                    logger.info(f"FALLBACK: Added source[{idx}] because it has coordinates")
+                    break
+        
+        # Filtrar sources para mostrar solo las citadas
+        actual_sources = [sources[i] for i in sorted(cited_source_ids)]
+        
+        # VERIFICACIÓN CRÍTICA: Asegurar que al menos hay UNA fuente con coordenadas
+        has_coords = any(src.get('coords') for src in actual_sources)
+        if not has_coords and sources:
+            logger.warning(f"CRITICAL: No cited sources have coordinates - searching for alternative")
+            # Buscar en TODAS las sources disponibles una que tenga coordenadas
+            for idx, src in enumerate(sources):
+                if src.get('coords'):
+                    logger.info(f"FOUND ALTERNATIVE with coords at sources[{idx}]")
+                    # Insertar como primera fuente
+                    actual_sources.insert(0, src)
+                    break
+        
+        # Si aún no hay sources, usar TODAS como último recurso
+        if not actual_sources:
+            actual_sources = sources
+            logger.warning(f"EMERGENCY FALLBACK: Using all {len(sources)} sources")
+        
+        logger.info(f"FINAL ACTUAL_SOURCES COUNT: {len(actual_sources)}")
+        for src_idx, src in enumerate(actual_sources):
+            logger.info(f"  FINAL[{src_idx}]: page={src.get('page')}, has_coords={bool(src.get('coords'))}, location={src.get('location', 'N/A')}")
+        logger.info(f"=== END SOURCE PARSING ===\n")
+        
+        # IMPORTANTE: Convertir [SOURCE_N] a superíndices visibles [N]
+        # Esto permite al usuario VER qué parte del texto corresponde a qué fuente
+        clean_answer = answer
+        
+        # Crear mapeo de SOURCE_N citado al índice en actual_sources (1-indexed para el usuario)
+        source_display_map = {}
+        for new_idx, old_idx in enumerate(sorted(cited_source_ids), start=1):
+            source_display_map[f"SOURCE_{old_idx + 1}"] = new_idx
+        
+        logger.info(f"SOURCE DISPLAY MAP: {source_display_map}")
+        
+        # Reemplazar [SOURCE_N] con [N] donde N es el índice en actual_sources
+        for source_id, display_num in source_display_map.items():
+            # Convertir [SOURCE_1] -> ¹ (superíndice) o [1] (corchetes simples)
+            clean_answer = clean_answer.replace(f"[{source_id}]", f"[{display_num}]")
+        
+        # Limpiar cualquier [SOURCE_N] que no haya sido mapeado (no debería pasar)
+        clean_answer = re.sub(r'\[SOURCE_\d+\]', '', clean_answer)
+        
+        # Limpiar espacios múltiples
+        clean_answer = re.sub(r'\s+', ' ', clean_answer)
+        clean_answer = clean_answer.strip()
+        
+        # Limpiar espacios antes de puntuación
+        clean_answer = re.sub(r'\s+([.,;:!?])', r'\1', clean_answer)
+        
+        logger.info(f"ANSWER AFTER CLEANING: {clean_answer[:500]}")
+        
+        sources_json = json.dumps(actual_sources) if actual_sources else None
+        page_number = actual_sources[0].get('page') if actual_sources and len(actual_sources) > 0 and 'page' in actual_sources[0] else None
         
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO messages (conversation_id, role, content, sources, page_number) VALUES (%s, %s, %s, %s, %s)",
-                (conversation_id, 'assistant', answer, sources_json, page_number)
+                (conversation_id, 'assistant', clean_answer, sources_json, page_number)
             )
             conn.commit()
         
@@ -2381,10 +2725,10 @@ Cuando el usuario pregunte sobre imágenes, diagramas, tablas, gráficos o cualq
         # Don't fail the entire request if saving fails
 
     return {
-        "response": answer,
+        "response": clean_answer if 'clean_answer' in locals() else answer,
         "used_vlm_enhanced": bool(used_vlm_enhanced and len(images_analyzed) > 0),
         "images_analyzed": images_analyzed,
-        "sources": sources,  # Evidence/provenance for frontend
+        "sources": actual_sources if 'actual_sources' in locals() else sources,  # Devolver solo fuentes citadas
         "suggested_questions": suggested_questions,
         "conversation_id": conversation_id
     }

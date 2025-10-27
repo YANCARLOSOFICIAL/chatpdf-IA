@@ -16,21 +16,32 @@
       </div>
       <!-- Evidence/Source links -->
       <div v-if="message.role === 'assistant' && message.sources && message.sources.length > 0" class="sources-container">
-        <div class="sources-title">📚 Fuentes:</div>
+        <div class="sources-title">📚 Referencias:</div>
         <div class="sources-list">
-          <button 
+          <div 
             v-for="(source, idx) in message.sources" 
             :key="idx"
-            class="source-item"
-            @click="$emit('go-to-source', source)"
-            :title="source.preview"
+            class="source-item-wrapper"
           >
-            <span class="source-icon">📄</span>
-            <span class="source-label">
-              <span v-if="source.page">Pág. {{ source.page }}</span>
-              <span v-else>Fragmento {{ idx + 1 }}</span>
-            </span>
-          </button>
+            <button 
+              class="source-item"
+              @click="$emit('go-to-source', source)"
+              :title="`${source.preview}\n\nHaz clic para navegar a esta página`"
+            >
+              <span class="source-icon">�</span>
+              <span class="source-label">
+                <span class="source-main">
+                  <span v-if="source.page">Página {{ source.page }}</span>
+                  <span v-else>Referencia {{ idx + 1 }}</span>
+                </span>
+                <span v-if="source.location" class="location-badge">{{ source.location }}</span>
+              </span>
+            </button>
+            <!-- Mostrar preview en hover/tooltip -->
+            <div class="source-tooltip">
+              <div class="preview-text">{{ source.preview }}</div>
+            </div>
+          </div>
         </div>
       </div>
       <div class="message-footer">
@@ -95,18 +106,48 @@ export default {
     formattedContent() {
       try {
         // Convertir markdown a HTML usando marked
-        const html = marked.parse(this.message.content || '');
+        let html = marked.parse(this.message.content || '');
+        
+        // Convertir referencias [1], [2], etc. en superíndices clicables
+        html = html.replace(/\[(\d+)\]/g, '<sup class="citation-ref" data-source-index="$1">[$1]</sup>');
+        
         // Sanitizar HTML para prevenir XSS (si DOMPurify está disponible)
         if (typeof DOMPurify !== 'undefined' && DOMPurify.sanitize) {
-          return DOMPurify.sanitize(html);
+          return DOMPurify.sanitize(html, { ADD_ATTR: ['data-source-index'] });
         }
         return html;
       } catch (error) {
         console.error('Error parsing markdown:', error);
-        // Fallback a texto plano
-        return this.message.content.replace(/\n/g, '<br>');
+        // Fallback a texto plano con conversión de referencias
+        let content = this.message.content.replace(/\n/g, '<br>');
+        content = content.replace(/\[(\d+)\]/g, '<sup class="citation-ref" data-source-index="$1">[$1]</sup>');
+        return content;
       }
     }
+  },
+  mounted() {
+    // Añadir event listener para clics en las referencias inline
+    this.$el.addEventListener('click', (event) => {
+      const target = event.target;
+      if (target.classList.contains('citation-ref')) {
+        const sourceIndex = parseInt(target.dataset.sourceIndex, 10);
+        if (sourceIndex && this.message.sources && this.message.sources[sourceIndex - 1]) {
+          // Scroll suave a la referencia correspondiente
+          const sourcesContainer = this.$el.querySelector('.sources-container');
+          if (sourcesContainer) {
+            const sourceItems = sourcesContainer.querySelectorAll('.source-item');
+            if (sourceItems[sourceIndex - 1]) {
+              sourceItems[sourceIndex - 1].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+              // Efecto visual temporal
+              sourceItems[sourceIndex - 1].classList.add('citation-highlight');
+              setTimeout(() => {
+                sourceItems[sourceIndex - 1].classList.remove('citation-highlight');
+              }, 1500);
+            }
+          }
+        }
+      }
+    });
   }
 };
 </script>
@@ -262,6 +303,32 @@ export default {
   margin-top: 0;
 }
 
+/* Referencias inline [1], [2], etc. */
+.message-text :deep(.citation-ref) {
+  color: #4d6cfa;
+  cursor: pointer;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  padding: 0 2px;
+  margin: 0 1px;
+  position: relative;
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+}
+
+.message-text :deep(.citation-ref:hover) {
+  color: #5a7bff;
+  text-shadow: 0 0 8px rgba(77, 108, 250, 0.5);
+  transform: scale(1.1);
+}
+
+.message-text :deep(.citation-ref:active) {
+  transform: scale(0.95);
+}
+
+
 .message-text :deep(p:last-child) {
   margin-bottom: 0;
 }
@@ -386,29 +453,57 @@ export default {
 .sources-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
+}
+
+.source-item-wrapper {
+  position: relative;
+  display: inline-block;
 }
 
 .source-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background: #1e2640;
-  border: 1px solid #2a3152;
-  border-radius: 6px;
+  gap: 8px;
+  padding: 8px 14px;
+  background: linear-gradient(135deg, #1e2640 0%, #2a3152 100%);
+  border: 1.5px solid #4d6cfa;
+  border-radius: 8px;
   color: #e4e6eb;
   font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.3s;
+  box-shadow: 0 2px 4px rgba(77, 108, 250, 0.1);
 }
 
 .source-item:hover {
-  background: #2a3152;
-  border-color: #4d6cfa;
-  color: #4d6cfa;
-  transform: translateY(-1px);
+  background: linear-gradient(135deg, #2a3152 0%, #3a4562 100%);
+  border-color: #7b8fff;
+  color: #7b8fff;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(77, 108, 250, 0.2);
 }
+
+/* Highlight temporal al hacer clic en referencia inline */
+.source-item.citation-highlight {
+  animation: citationPulse 1.5s ease-out;
+}
+
+@keyframes citationPulse {
+  0%, 100% {
+    background: linear-gradient(135deg, #1e2640 0%, #2a3152 100%);
+    border-color: #4d6cfa;
+    box-shadow: 0 2px 4px rgba(77, 108, 250, 0.1);
+  }
+  50% {
+    background: linear-gradient(135deg, #4d6cfa 0%, #5a7bff 100%);
+    border-color: #7b8fff;
+    box-shadow: 0 0 20px rgba(77, 108, 250, 0.6);
+    transform: scale(1.05);
+  }
+}
+
 
 .source-icon {
   font-size: 14px;
@@ -416,6 +511,68 @@ export default {
 
 .source-label {
   font-weight: 500;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.source-main {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.location-badge {
+  font-size: 11px;
+  opacity: 0.7;
+  font-weight: 400;
+  color: #9ca3af;
+}
+
+/* Tooltip que aparece al pasar el mouse */
+.source-tooltip {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  bottom: 125%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0a0e27;
+  border: 1px solid #4d6cfa;
+  border-radius: 6px;
+  padding: 10px 12px;
+  z-index: 1000;
+  white-space: normal;
+  width: 280px;
+  max-height: 150px;
+  overflow-y: auto;
+  transition: opacity 0.3s, visibility 0.3s;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.source-item-wrapper:hover .source-tooltip {
+  visibility: visible;
+  opacity: 1;
+}
+
+.preview-text {
+  font-size: 12px;
+  color: #e4e6eb;
+  line-height: 1.4;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Arrow del tooltip */
+.source-tooltip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  margin-left: -5px;
+  border-width: 5px;
+  border-style: solid;
+  border-color: #4d6cfa transparent transparent transparent;
 }
 
 :global(#app.light-mode) .sources-container {
@@ -437,6 +594,15 @@ export default {
   background: #edf2f7;
   border-color: #4d6cfa;
   color: #4d6cfa;
+}
+
+:global(#app.light-mode) .source-tooltip {
+  background: #ffffff;
+  border-color: #4d6cfa;
+}
+
+:global(#app.light-mode) .preview-text {
+  color: #1a202c;
 }
 
 .vlm-meta {
